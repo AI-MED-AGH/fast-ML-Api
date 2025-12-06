@@ -121,11 +121,12 @@ class MLController(ABC):
         self._preprocessing_fn: Optional[Callable] = None
         self._postprocessing_fn: Optional[Callable] = None
         self._prediction_fn: Optional[Callable] = None
+        self._custom_routes: list = []
         self._app: Optional[FastAPI] = None
         self._discover_processors()
     
     def _discover_processors(self) -> None:
-        """Discover methods marked with @preprocessing, @postprocessing, and @prediction decorators."""
+        """Discover methods marked with @preprocessing, @postprocessing, @prediction, and @route decorators."""
         for name in dir(self.__class__):
             if name.startswith('_'):
                 continue
@@ -149,6 +150,13 @@ class MLController(ABC):
                 if hasattr(method, '_is_prediction') and method._is_prediction:
                     self._prediction_fn = method
                     logger.debug(f"Discovered prediction function: {name}")
+                if hasattr(method, '_is_route') and method._is_route:
+                    config = getattr(method, '_route_config', {})
+                    self._custom_routes.append({
+                        "endpoint": method,
+                        **config,
+                    })
+                    logger.debug(f"Discovered custom route: {name} -> {config.get('path')}")
             except Exception:
                 continue
     
@@ -211,6 +219,61 @@ class MLController(ABC):
     def is_loaded(self) -> bool:
         """Check if the model is loaded or prediction function is available."""
         return self._model is not None or self._prediction_fn is not None
+    
+    def add_route(
+        self,
+        path: str,
+        endpoint: Callable,
+        methods: list = None,
+        response_model: Optional[Type[BaseModel]] = None,
+        tags: Optional[list] = None,
+        summary: Optional[str] = None,
+        description: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        """
+        Add a custom route to the API.
+        
+        This method allows you to add additional endpoints beyond /predict.
+        Routes must be added before accessing the `app` property or calling `run()`.
+        
+        Args:
+            path: The URL path for the endpoint (e.g., "/analyze", "/batch")
+            endpoint: The async function to handle requests
+            methods: HTTP methods (default: ["GET"])
+            response_model: Optional Pydantic model for response validation
+            tags: OpenAPI tags for documentation
+            summary: Short summary for OpenAPI docs
+            description: Detailed description for OpenAPI docs
+            **kwargs: Additional arguments passed to FastAPI's add_api_route
+        
+        Example:
+            class MyController(MLController):
+                def __init__(self):
+                    super().__init__()
+                    self.add_route("/batch", self.batch_predict, methods=["POST"])
+                
+                async def batch_predict(self, request: Request):
+                    data = await request.json()
+                    results = [await self.predict(item) for item in data["items"]]
+                    return {"results": results}
+        """
+        if self._app is not None:
+            raise RuntimeError(
+                "Cannot add routes after the app has been created. "
+                "Add routes in __init__ before accessing .app or calling .run()"
+            )
+        
+        self._custom_routes.append({
+            "path": path,
+            "endpoint": endpoint,
+            "methods": methods or ["GET"],
+            "response_model": response_model,
+            "tags": tags or ["Custom"],
+            "summary": summary,
+            "description": description,
+            **kwargs,
+        })
     
     def preprocess(self, data: Any) -> Any:
         """
@@ -421,6 +484,20 @@ class MLController(ABC):
                 }
             },
         )
+        
+        # Register custom routes
+        for route_config in self._custom_routes:
+            endpoint = route_config.pop("endpoint")
+            path = route_config.pop("path")
+            methods = route_config.pop("methods", ["GET"])
+            
+            app.add_api_route(
+                path,
+                endpoint,
+                methods=methods,
+                **route_config,
+            )
+            logger.debug(f"Registered custom route: {methods} {path}")
         
         return app
     

@@ -8,7 +8,8 @@ A FastAPI-based ML model serving library for easy deployment. Create production-
 - 🔄 **Automatic `/predict` endpoint**: Generated automatically with proper request/response handling
 - 🎯 **Flexible prediction**: Use `load_model()` for standard models or `@prediction` decorator for custom logic
 - 🔧 **Data pipelines**: `@preprocessing` and `@postprocessing` decorators for clean data flow
-- 📊 **Health checks**: Built-in `/health` endpoint
+- �️ **Custom endpoints**: Add additional routes with `@route` decorator
+- �📊 **Health checks**: Built-in `/health` endpoint
 - 📝 **Auto documentation**: Swagger/OpenAPI docs out of the box
 - 🎨 **Customizable**: Custom request/response Pydantic models supported
 
@@ -150,6 +151,7 @@ Request → preprocess() → predict_raw() → postprocess() → Response
 | `@preprocessing` | Mark a method as the preprocessing step | No (defaults to pass-through) |
 | `@postprocessing` | Mark a method as the postprocessing step | No (defaults to `{"result": prediction}`) |
 | `@prediction` | Mark a method as the custom prediction function | No (uses `model.predict()` by default) |
+| `@route` | Add a custom API endpoint | No |
 
 ## Running the Server
 
@@ -209,6 +211,93 @@ curl -X POST http://localhost:8000/predict \
 ```
 
 ## Advanced Usage
+
+### Custom Endpoints with `@route` Decorator
+
+Add additional API endpoints beyond `/predict` using the `@route` decorator:
+
+```python
+from fastmlapi import MLController, preprocessing, postprocessing, route
+from fastapi import Request
+from typing import List
+
+class MyController(MLController):
+    model_name = "my-model"
+    
+    def load_model(self):
+        return joblib.load("model.pkl")
+    
+    @preprocessing
+    def preprocess(self, data: dict):
+        return np.array(data["features"]).reshape(1, -1)
+    
+    @postprocessing
+    def postprocess(self, prediction):
+        return {"class": int(prediction[0])}
+    
+    # Custom endpoint for batch predictions
+    @route("/batch", methods=["POST"], tags=["Batch"], summary="Batch prediction")
+    async def batch_predict(self, request: Request):
+        """Process multiple predictions in one request."""
+        data = await request.json()
+        results = []
+        for item in data["items"]:
+            result = await self.predict(item)
+            results.append(result)
+        return {"results": results, "count": len(results)}
+    
+    # Custom endpoint for model info
+    @route("/model-info", methods=["GET"], tags=["Info"])
+    async def model_info(self):
+        """Get detailed model information."""
+        return {
+            "name": self.model_name,
+            "version": self.model_version,
+            "features": ["feature1", "feature2", "feature3"],
+            "classes": ["negative", "positive"]
+        }
+    
+    # Custom endpoint with path parameters
+    @route("/predict/{category}", methods=["POST"], tags=["Prediction"])
+    async def predict_by_category(self, request: Request, category: str):
+        """Run prediction for a specific category."""
+        data = await request.json()
+        data["category"] = category
+        return await self.predict(data)
+
+if __name__ == "__main__":
+    MyController().run()
+```
+
+#### `@route` Decorator Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | str | (required) | URL path (e.g., `/batch`, `/analyze`) |
+| `methods` | list | `["GET"]` | HTTP methods (`["GET"]`, `["POST"]`, etc.) |
+| `response_model` | BaseModel | `None` | Pydantic model for response validation |
+| `tags` | list | `["Custom"]` | OpenAPI tags for documentation |
+| `summary` | str | `None` | Short description for docs |
+| `description` | str | `None` | Detailed description for docs |
+
+### Alternative: Using `add_route()` Method
+
+You can also add routes programmatically in `__init__`:
+
+```python
+class MyController(MLController):
+    def __init__(self):
+        super().__init__()
+        self.add_route("/status", self.get_status, methods=["GET"])
+        self.add_route("/batch", self.batch_predict, methods=["POST"])
+    
+    async def get_status(self):
+        return {"status": "ready", "model_loaded": self.is_loaded}
+    
+    async def batch_predict(self, request: Request):
+        data = await request.json()
+        return {"results": [await self.predict(item) for item in data["items"]]}
+```
 
 ### Custom Request/Response Models
 

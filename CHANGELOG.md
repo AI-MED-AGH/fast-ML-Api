@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2024-12-06
+
+### Added
+
+- `@route` decorator for adding custom API endpoints
+- `add_route()` method for programmatic route registration
+- Custom endpoints are auto-discovered and registered with FastAPI
+- Full OpenAPI documentation support for custom routes
+
 ## [0.1.1] - 2024-12-06
 
 ### Added
@@ -44,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Uvicorn >= 0.23.0
 - Pydantic >= 2.0.0
 
-[Unreleased]: https://github.com/grzegorzprywatny/fastmlapi/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/grzegorzprywatny/fastmlapi/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/grzegorzprywatny/fastmlapi/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/grzegorzprywatny/fastmlapi/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/grzegorzprywatny/fastmlapi/releases/tag/v0.1.0

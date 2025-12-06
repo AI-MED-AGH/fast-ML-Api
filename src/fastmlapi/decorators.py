@@ -87,3 +87,62 @@ def prediction(func: F) -> F:
     
     setattr(wrapper, "_is_prediction", True)
     return cast(F, wrapper)
+
+
+def route(
+    path: str,
+    methods: list = None,
+    response_model: Any = None,
+    tags: list = None,
+    summary: str = None,
+    description: str = None,
+    **kwargs,
+) -> Callable[[F], F]:
+    """
+    Decorator to mark a method as a custom API route.
+    
+    This decorator allows you to add custom endpoints to your API
+    in a declarative way, similar to FastAPI's @app.get/@app.post.
+    
+    Args:
+        path: The URL path for the endpoint (e.g., "/analyze", "/batch")
+        methods: HTTP methods (default: ["GET"])
+        response_model: Optional Pydantic model for response validation
+        tags: OpenAPI tags for documentation
+        summary: Short summary for OpenAPI docs
+        description: Detailed description for OpenAPI docs
+        **kwargs: Additional arguments passed to FastAPI's add_api_route
+    
+    Example:
+        class MyController(MLController):
+            @route("/batch", methods=["POST"], tags=["Batch"])
+            async def batch_predict(self, request: Request):
+                data = await request.json()
+                results = [await self.predict(item) for item in data["items"]]
+                return {"results": results}
+            
+            @route("/status", methods=["GET"])
+            async def get_status(self):
+                return {"queue_size": 0, "processing": False}
+    """
+    def decorator(func: F) -> F:
+        setattr(func, "_is_route", True)
+        setattr(func, "_route_config", {
+            "path": path,
+            "methods": methods or ["GET"],
+            "response_model": response_model,
+            "tags": tags or ["Custom"],
+            "summary": summary,
+            "description": description,
+            **kwargs,
+        })
+        
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return func(*args, **kwargs)
+        
+        setattr(wrapper, "_is_route", True)
+        setattr(wrapper, "_route_config", getattr(func, "_route_config"))
+        return cast(F, wrapper)
+    
+    return decorator
