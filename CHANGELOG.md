@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2024-12-06
+
+### Added
+
+- `@prediction` decorator for custom prediction logic (PyTorch, TensorFlow, external APIs)
+- `load_model()` is now optional when using `@prediction` decorator
+- Improved README with comprehensive usage examples and documentation
+
+### Changed
+
+- `MLController` no longer requires `load_model()` to be overridden
+- Better error messages when model is not loaded and no `@prediction` is defined
+
 ## [0.1.0] - 2024-12-06
 
 ### Added
@@ -31,5 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Uvicorn >= 0.23.0
 - Pydantic >= 2.0.0
 
-[Unreleased]: https://github.com/grzegorzprywatny/fastmlapi/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/grzegorzprywatny/fastmlapi/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/grzegorzprywatny/fastmlapi/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/grzegorzprywatny/fastmlapi/releases/tag/v0.1.0

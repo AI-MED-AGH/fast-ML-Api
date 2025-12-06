@@ -1,5 +1,5 @@
 """
-Decorators for marking preprocessing and postprocessing methods.
+Decorators for marking preprocessing, postprocessing, and prediction methods.
 """
 
 from functools import wraps
@@ -49,4 +49,41 @@ def postprocessing(func: F) -> F:
         return func(*args, **kwargs)
     
     setattr(wrapper, "_is_postprocessing", True)
+    return cast(F, wrapper)
+
+
+def prediction(func: F) -> F:
+    """
+    Decorator to mark a method as a custom prediction function.
+    
+    The prediction function receives preprocessed data and should return
+    the model's prediction output. Use this when you need full control
+    over the prediction logic, bypassing the default `model.predict()` call.
+    
+    When using this decorator, you don't need to implement `load_model()` 
+    unless you want to load a model during initialization.
+    
+    Example:
+        @prediction
+        def predict(self, data: np.ndarray) -> np.ndarray:
+            # Custom prediction logic
+            with torch.no_grad():
+                tensor = torch.from_numpy(data)
+                output = self.model(tensor)
+                return output.numpy()
+    
+    Example without load_model:
+        @prediction
+        def predict(self, data: dict) -> dict:
+            # Call external API, run custom logic, etc.
+            result = external_ml_service.predict(data)
+            return result
+    """
+    setattr(func, "_is_prediction", True)
+    
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+    
+    setattr(wrapper, "_is_prediction", True)
     return cast(F, wrapper)

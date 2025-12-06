@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastmlapi"
-version = "0.1.0"
+version = "0.1.1"
 description = "A FastAPI-based ML worker node library for easy model deployment"
 readme = "README.md"
 license = "MIT"

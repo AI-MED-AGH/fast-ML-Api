@@ -2,7 +2,7 @@
 MLController - Unified ML model controller with built-in FastAPI server.
 """
 
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Any, Dict, Optional, Type, Callable
 import logging
 from contextlib import asynccontextmanager
@@ -26,12 +26,20 @@ class MLController(ABC):
     """
     Unified ML model controller with built-in FastAPI server.
     
-    Users should extend this class and implement:
-    - load_model(): Load and return the ML model
-    - preprocess(): Prepare input data for the model (use @preprocessing decorator)
-    - postprocess(): Format model output for API response (use @postprocessing decorator)
+    Users should extend this class and implement prediction logic in one of these ways:
     
-    Example:
+    Option 1: Traditional approach with load_model (recommended for sklearn, etc.)
+        - load_model(): Load and return the ML model
+        - preprocess(): Prepare input data for the model (use @preprocessing decorator)
+        - postprocess(): Format model output for API response (use @postprocessing decorator)
+    
+    Option 2: Custom prediction function (recommended for complex inference)
+        - Use @prediction decorator on a method that handles the full prediction
+        - preprocess(): Optional preprocessing (use @preprocessing decorator)
+        - postprocess(): Optional postprocessing (use @postprocessing decorator)
+        - load_model() becomes optional
+    
+    Example with load_model:
         from fastmlapi import MLController, preprocessing, postprocessing
         import numpy as np
         
@@ -49,6 +57,42 @@ class MLController(ABC):
             @postprocessing
             def postprocess(self, prediction: np.ndarray) -> dict:
                 return {"class": int(prediction[0])}
+    
+    Example with @prediction decorator:
+        from fastmlapi import MLController, prediction, postprocessing
+        import torch
+        
+        class PyTorchModel(MLController):
+            model_name = "pytorch-model"
+            
+            def load_model(self):
+                model = torch.load("model.pt")
+                model.eval()
+                return model
+            
+            @prediction
+            def run_inference(self, data: dict) -> torch.Tensor:
+                with torch.no_grad():
+                    tensor = torch.tensor(data["features"])
+                    return self.model(tensor)
+            
+            @postprocessing
+            def postprocess(self, output: torch.Tensor) -> dict:
+                return {"result": output.tolist()}
+    
+    Example without load_model (external service, custom logic):
+        from fastmlapi import MLController, prediction
+        
+        class ExternalAPIController(MLController):
+            model_name = "external-api"
+            
+            def load_model(self):
+                return None  # No model needed
+            
+            @prediction
+            def call_external(self, data: dict) -> dict:
+                response = requests.post("https://api.example.com/predict", json=data)
+                return response.json()
         
         # Run the server
         if __name__ == "__main__":
@@ -76,11 +120,12 @@ class MLController(ABC):
         self._model = None
         self._preprocessing_fn: Optional[Callable] = None
         self._postprocessing_fn: Optional[Callable] = None
+        self._prediction_fn: Optional[Callable] = None
         self._app: Optional[FastAPI] = None
         self._discover_processors()
     
     def _discover_processors(self) -> None:
-        """Discover methods marked with @preprocessing and @postprocessing decorators."""
+        """Discover methods marked with @preprocessing, @postprocessing, and @prediction decorators."""
         for name in dir(self.__class__):
             if name.startswith('_'):
                 continue
@@ -101,20 +146,46 @@ class MLController(ABC):
                 if hasattr(method, '_is_postprocessing') and method._is_postprocessing:
                     self._postprocessing_fn = method
                     logger.debug(f"Discovered postprocessing function: {name}")
+                if hasattr(method, '_is_prediction') and method._is_prediction:
+                    self._prediction_fn = method
+                    logger.debug(f"Discovered prediction function: {name}")
             except Exception:
                 continue
     
-    @abstractmethod
     def load_model(self) -> Any:
         """
         Load and return the ML model.
         
         This method is called once during server startup.
         
+        Override this method to load your model. If you're using the @prediction
+        decorator with custom logic that doesn't need a model, you can either:
+        - Not override this method (returns None)
+        - Return None explicitly
+        
         Returns:
-            The loaded model object.
+            The loaded model object, or None if not needed.
+        
+        Examples:
+            # sklearn
+            def load_model(self):
+                return joblib.load("model.pkl")
+            
+            # PyTorch
+            def load_model(self):
+                model = torch.load("model.pt")
+                model.eval()
+                return model
+            
+            # TensorFlow/Keras
+            def load_model(self):
+                return tf.keras.models.load_model("model.h5")
+            
+            # External API (no model needed)
+            def load_model(self):
+                return None
         """
-        pass
+        return None
     
     def initialize(self) -> None:
         """Initialize the controller and load the model."""
@@ -124,17 +195,22 @@ class MLController(ABC):
     
     @property
     def model(self) -> Any:
-        """Get the loaded model instance."""
-        if self._model is None:
+        """
+        Get the loaded model instance.
+        
+        Note: If using @prediction decorator without a model, this may return None.
+        """
+        if self._model is None and self._prediction_fn is None:
             raise RuntimeError(
-                "Model not loaded. Call initialize() first or use run() to start the server."
+                "Model not loaded. Either implement load_model() to return a model, "
+                "or use @prediction decorator for custom prediction logic."
             )
         return self._model
     
     @property
     def is_loaded(self) -> bool:
-        """Check if the model is loaded."""
-        return self._model is not None
+        """Check if the model is loaded or prediction function is available."""
+        return self._model is not None or self._prediction_fn is not None
     
     def preprocess(self, data: Any) -> Any:
         """
@@ -164,8 +240,21 @@ class MLController(ABC):
         """
         Run prediction on preprocessed data.
         
-        Override this method if your model doesn't have a standard predict() method.
+        This method is called after preprocessing and before postprocessing.
+        
+        You can customize prediction in several ways:
+        1. Use the @prediction decorator on a custom method (recommended)
+        2. Override this method directly
+        3. Return a model with a predict() method from load_model()
+        4. Return a callable from load_model()
+        
+        If using @prediction decorator, load_model() becomes optional.
         """
+        # Use custom prediction function if decorated with @prediction
+        if self._prediction_fn:
+            return self._prediction_fn(preprocessed_data)
+        
+        # Otherwise use the loaded model
         if hasattr(self.model, 'predict'):
             return self.model.predict(preprocessed_data)
         elif callable(self.model):
@@ -173,7 +262,7 @@ class MLController(ABC):
         else:
             raise NotImplementedError(
                 "Model doesn't have a predict() method and is not callable. "
-                "Override predict_raw() to implement custom prediction logic."
+                "Use @prediction decorator or override predict_raw() to implement custom prediction logic."
             )
     
     async def predict(self, data: Any) -> Dict[str, Any]:
