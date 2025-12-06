@@ -269,25 +269,22 @@ class MLController(ABC):
             }
         
         # Predict endpoint
-        request_model = self.request_model or PredictionRequest
-        response_model = self.response_model or PredictionResponse
+        RequestModel: Type[BaseModel] = self.request_model or PredictionRequest
+        ResponseModel: Type[BaseModel] = self.response_model or PredictionResponse
         
-        @app.post(
-            "/predict",
-            response_model=response_model,
-            tags=["Prediction"],
-            summary=f"Predict using {self.model_name}",
-            description=f"Run prediction using the {self.model_name} model (v{self.model_version})",
-        )
-        async def predict_endpoint(request: request_model):
+        async def predict_endpoint(request: Request) -> Any:
             """Run prediction on the input data."""
             try:
+                # Parse request body using the configured model
+                body = await request.json()
+                validated_request = RequestModel.model_validate(body)
+                
                 # Extract data from request
-                if hasattr(request, 'data'):
-                    data = request.data
+                if hasattr(validated_request, 'data'):
+                    data = getattr(validated_request, 'data')
                 else:
                     # If custom request model, pass the whole request
-                    data = request.model_dump()
+                    data = validated_request.model_dump()
                 
                 # Run prediction pipeline
                 result = await controller.predict(data)
@@ -314,6 +311,27 @@ class MLController(ABC):
                         "error_type": type(e).__name__,
                     },
                 )
+        
+        # Register the predict endpoint with proper OpenAPI schema
+        app.add_api_route(
+            "/predict",
+            predict_endpoint,
+            methods=["POST"],
+            response_model=ResponseModel,
+            tags=["Prediction"],
+            summary=f"Predict using {self.model_name}",
+            description=f"Run prediction using the {self.model_name} model (v{self.model_version})",
+            openapi_extra={
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": RequestModel.model_json_schema()
+                        }
+                    },
+                    "required": True,
+                }
+            },
+        )
         
         return app
     
