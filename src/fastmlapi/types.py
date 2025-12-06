@@ -2,7 +2,7 @@
 Type definitions for FastMLAPI.
 """
 
-from typing import Any, Dict, Generic, TypeVar, Optional
+from typing import Any, Dict, TypeVar, Optional
 from pydantic import BaseModel, Field
 
 InputT = TypeVar("InputT")

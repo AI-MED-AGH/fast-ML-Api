@@ -3,7 +3,7 @@ Decorators for marking preprocessing and postprocessing methods.
 """
 
 from functools import wraps
-from typing import Callable, Any
+from typing import Callable
 
 
 def preprocessing(func: Callable) -> Callable:
