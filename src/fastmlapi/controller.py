@@ -224,12 +224,12 @@ class MLController(ABC):
         self,
         path: str,
         endpoint: Callable,
-        methods: list = None,
+        methods: Optional[list] = None,
         response_model: Optional[Type[BaseModel]] = None,
         tags: Optional[list] = None,
         summary: Optional[str] = None,
         description: Optional[str] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """
         Add a custom route to the API.

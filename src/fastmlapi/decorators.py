@@ -3,7 +3,7 @@ Decorators for marking preprocessing, postprocessing, and prediction methods.
 """
 
 from functools import wraps
-from typing import Any, Callable, TypeVar, cast
+from typing import Any, Callable, List, Optional, TypeVar, cast
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -91,12 +91,12 @@ def prediction(func: F) -> F:
 
 def route(
     path: str,
-    methods: list = None,
+    methods: Optional[List[str]] = None,
     response_model: Any = None,
-    tags: list = None,
-    summary: str = None,
-    description: str = None,
-    **kwargs,
+    tags: Optional[List[str]] = None,
+    summary: Optional[str] = None,
+    description: Optional[str] = None,
+    **kwargs: Any,
 ) -> Callable[[F], F]:
     """
     Decorator to mark a method as a custom API route.
