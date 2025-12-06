@@ -7,22 +7,42 @@ name = "fastmlapi"
 version = "0.1.0"
 description = "A FastAPI-based ML worker node library for easy model deployment"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Grzegorz Majgier"}
 ]
-keywords = ["fastapi", "machine-learning", "api", "ml-serving", "model-deployment"]
+maintainers = [
+    {name = "Grzegorz Majgier"}
+]
+keywords = [
+    "fastapi", 
+    "machine-learning", 
+    "api", 
+    "ml-serving", 
+    "model-deployment",
+    "ml-ops",
+    "inference",
+    "model-serving",
+    "rest-api",
+    "python"
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Framework :: FastAPI",
+    "Framework :: Pydantic :: 2",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 requires-python = ">=3.9"
 dependencies = [
@@ -36,12 +56,20 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "httpx>=0.24.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+docs = [
+    "mkdocs>=1.5.0",
+    "mkdocs-material>=9.0.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/fastmlapi"
-Documentation = "https://github.com/yourusername/fastmlapi#readme"
-Repository = "https://github.com/yourusername/fastmlapi"
+Homepage = "https://github.com/Artificial-Intelligence-in-Medicine-AGH/fast-ML-Api"
+Documentation = "https://github.com/Artificial-Intelligence-in-Medicine-AGH/fast-ML-Api#readme"
+Repository = "https://github.com/Artificial-Intelligence-in-Medicine-AGH/fast-ML-Api"
+Issues = "https://github.com/Artificial-Intelligence-in-Medicine-AGH/fast-ML-Api/issues"
+Changelog = "https://github.com/Artificial-Intelligence-in-Medicine-AGH/fast-ML-Api/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
