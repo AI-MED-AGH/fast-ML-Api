@@ -3,6 +3,7 @@ Tests for FastMLAPI.
 """
 
 import pytest
+from unittest.mock import MagicMock
 from fastapi.testclient import TestClient
 import numpy as np
 
@@ -82,9 +83,12 @@ class TestMLController:
     def test_controller_initialization(self):
         """Test controller initializes correctly."""
         controller = MockClassifier()
-        controller.initialize()
+        controller.setup = MagicMock()
+
+        controller._initialize()
         assert controller.is_loaded is True
-    
+        controller.setup.assert_called()
+
     def test_controller_not_loaded_error(self):
         """Test accessing model before loading raises error."""
         controller = MockClassifier()
@@ -94,7 +98,7 @@ class TestMLController:
     def test_health_check(self):
         """Test health check method."""
         controller = MockClassifier()
-        controller.initialize()
+        controller._initialize()
         health = controller.health_check()
         assert health["status"] == "healthy"
         assert health["model_loaded"] is True
