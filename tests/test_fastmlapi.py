@@ -40,9 +40,13 @@ class TestMLController:
     """Tests for MLController."""
     
     def test_root_endpoint(self, client):
-        """Test the root endpoint returns API info."""
+        """Test the root endpoint returns 404 by default."""
         response = client.get("/")
-        assert response.status_code == 200
+        assert response.status_code == 404
+
+    def test_info_endpoint(self, client):
+        """Test the info endpoint returns model info."""
+        response = client.get("/info")
         data = response.json()
         assert data["name"] == "test-classifier"
         assert data["endpoint"] == "/predict"
