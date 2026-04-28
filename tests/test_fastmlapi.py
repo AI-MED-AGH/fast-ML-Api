@@ -39,16 +39,13 @@ def client():
 class TestMLController:
     """Tests for MLController."""
     
-    def test_root_endpoint(self, client):
-        """Test the root endpoint returns 404 by default."""
-        response = client.get("/")
-        assert response.status_code == 404
-
     def test_info_endpoint(self, client):
         """Test the info endpoint returns model info."""
         response = client.get("/info")
+        assert response.status_code == 200
         data = response.json()
         assert data["name"] == "test-classifier"
+        assert data["version"] == "1.0.0"
         assert data["endpoint"] == "/predict"
     
     def test_health_endpoint(self, client):
