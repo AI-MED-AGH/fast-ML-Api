@@ -222,8 +222,8 @@ after the FastAPI app is configured and before the model is loaded.
 from fastmlapi import MLController
 
 def load_thresholds(path: str) -> dict:
-    """Example helper; implement your own loading logic."""
-    ...
+    """Example helper; return a mapping of labels to threshold values."""
+    return {"default": 0.5}
 
 class ThresholdController(MLController):
     model_name = "threshold-model"
