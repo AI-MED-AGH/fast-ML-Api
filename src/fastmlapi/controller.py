@@ -160,6 +160,14 @@ class MLController(ABC):
             except Exception:
                 continue
     
+    def setup(self):
+        """
+        Override this method to initialize the model or perform other setup tasks.
+        
+        This method is run after FastAPI self.app is configured, so it can be used to add custom endpoints.
+        """
+        pass
+    
     def load_model(self) -> Any:
         """
         Load and return the ML model.
@@ -195,8 +203,14 @@ class MLController(ABC):
         """
         return None
     
-    def initialize(self) -> None:
-        """Initialize the controller and load the model."""
+    def _initialize(self) -> None:
+        """
+        Do NOT override this method! You can override init instead, to do perform setup tasks.
+        
+        Initialize the controller and load the model.
+        """
+        logger.info("Initializing controller")
+        self.setup()
         logger.info(f"Loading model: {self.model_name} v{self.model_version}")
         self._model = self.load_model()
         logger.info(f"Model loaded successfully: {self.model_name}")
@@ -368,7 +382,7 @@ class MLController(ABC):
             # Startup: Initialize controller
             logger.info(f"Initializing {controller.model_name}...")
             try:
-                controller.initialize()
+                controller._initialize()
             except Exception as e:
                 logger.error(f"Failed to initialize {controller.model_name}: {e}")
                 raise

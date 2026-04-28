@@ -9,6 +9,7 @@ A FastAPI-based ML model serving library for easy deployment. Create production-
 - 🎯 **Flexible prediction**: Use `load_model()` for standard models or `@prediction` decorator for custom logic
 - 🔧 **Data pipelines**: `@preprocessing` and `@postprocessing` decorators for clean data flow
 - �️ **Custom endpoints**: Add additional routes with `@route` decorator
+- 🧰 **setup() hook**: Override `setup()` for extra initialization and route registration
 - �📊 **Health checks**: Built-in `/health` endpoint
 - 📝 **Auto documentation**: Swagger/OpenAPI docs out of the box
 - 🎨 **Customizable**: Custom request/response Pydantic models supported
@@ -212,6 +213,29 @@ curl -X POST http://localhost:8000/predict \
 
 ## Advanced Usage
 
+### Initialization with `setup()`
+
+Use `setup()` to perform additional initialization (load auxiliary data, warm caches) or register routes
+after the FastAPI app is configured and before the model is loaded.
+
+```python
+from fastmlapi import MLController
+
+def load_thresholds(path: str) -> dict:
+    """Example helper; return a mapping of labels to threshold values."""
+    return {"default": 0.5}
+
+class ThresholdController(MLController):
+    model_name = "threshold-model"
+    
+    def setup(self):
+        self.thresholds = load_thresholds("thresholds.json")
+        self.add_route("/status", self.status, methods=["GET"])
+    
+    async def status(self):
+        return {"ready": self.is_loaded, "thresholds": self.thresholds}
+```
+
 ### Custom Endpoints with `@route` Decorator
 
 Add additional API endpoints beyond `/predict` using the `@route` decorator:
@@ -282,12 +306,11 @@ if __name__ == "__main__":
 
 ### Alternative: Using `add_route()` Method
 
-You can also add routes programmatically in `__init__`:
+You can also add routes programmatically in `setup()`:
 
 ```python
 class MyController(MLController):
-    def __init__(self):
-        super().__init__()
+    def setup(self):
         self.add_route("/status", self.get_status, methods=["GET"])
         self.add_route("/batch", self.batch_predict, methods=["POST"])
     
