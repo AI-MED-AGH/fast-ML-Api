@@ -411,8 +411,8 @@ class MLController(ABC):
                 return controller.health_check()
         
         # Root endpoint
-        @app.get("/", tags=["Info"])
-        async def root():
+        @app.get("/info", tags=["Info"])
+        async def info():
             """API information endpoint."""
             return {
                 "name": controller.model_name,
