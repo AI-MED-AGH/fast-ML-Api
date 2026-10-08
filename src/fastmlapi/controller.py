@@ -4,13 +4,17 @@ MLController - Unified ML model controller with built-in FastAPI server.
 
 from abc import ABC
 from typing import Any, Dict, Optional, Type, Callable
+import importlib
 import logging
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ._version import __version__
 from .types import (
     PredictionRequest,
     PredictionResponse,
@@ -20,6 +24,15 @@ from .types import (
 
 
 logger = logging.getLogger(__name__)
+
+ENV_HOST = "FASTMLAPI_HOST"
+ENV_PORT = "FASTMLAPI_PORT"
+ENV_CACHE_DIR = "FASTMLAPI_CACHE_DIR"
+ENV_GPU_MEMORY_FRACTION = "FASTMLAPI_GPU_MEMORY_FRACTION"
+
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8000
+DEFAULT_CACHE_DIR = "./.cache/fastmlapi"
 
 
 class MLController(ABC):
@@ -112,12 +125,27 @@ class MLController(ABC):
     request_model: Optional[Type[BaseModel]] = None
     response_model: Optional[Type[BaseModel]] = None
     
+    # Optional examples, exposed by GET /schema
+    request_example: Optional[Dict[str, Any]] = None
+    response_example: Optional[Dict[str, Any]] = None
+    
+    # Optional per-process GPU memory cap (0 < x <= 1), best effort, torch only.
+    # Overridden by the FASTMLAPI_GPU_MEMORY_FRACTION environment variable.
+    gpu_memory_fraction: Optional[float] = None
+    
     # Enable/disable features
     enable_health: bool = True
     enable_docs: bool = True
     
     def __init__(self):
         self._model = None
+        self._ready = False
+        self._gpu_available: Optional[bool] = None
+        # Persistent cache directory (FASTMLAPI_CACHE_DIR). The path is known
+        # from construction; the directory itself is created before setup().
+        self.cache_dir: Path = Path(
+            os.environ.get(ENV_CACHE_DIR) or DEFAULT_CACHE_DIR
+        ).expanduser()
         self._preprocessing_fn: Optional[Callable] = None
         self._postprocessing_fn: Optional[Callable] = None
         self._prediction_fn: Optional[Callable] = None
@@ -210,10 +238,53 @@ class MLController(ABC):
         Initialize the controller and load the model.
         """
         logger.info("Initializing controller")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._apply_gpu_memory_fraction()
         self.setup()
         logger.info(f"Loading model: {self.model_name} v{self.model_version}")
         self._model = self.load_model()
+        self._ready = True
         logger.info(f"Model loaded successfully: {self.model_name}")
+    
+    def _resolve_gpu_memory_fraction(self) -> Optional[float]:
+        """Return the configured GPU memory fraction (env overrides class attribute)."""
+        raw: Any = os.environ.get(ENV_GPU_MEMORY_FRACTION) or self.gpu_memory_fraction
+        if raw is None:
+            return None
+        try:
+            fraction = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid GPU memory fraction {raw!r}: expected a number in (0, 1]")
+        if not 0 < fraction <= 1:
+            raise ValueError(f"Invalid GPU memory fraction {fraction}: must satisfy 0 < x <= 1")
+        return fraction
+    
+    def _apply_gpu_memory_fraction(self) -> None:
+        """Best-effort GPU memory cap via torch. No-op if torch or CUDA is unavailable."""
+        fraction = self._resolve_gpu_memory_fraction()
+        if fraction is None:
+            return
+        try:
+            torch = importlib.import_module("torch")
+        except ImportError:
+            logger.info("GPU memory fraction %s requested but torch is not installed; ignoring", fraction)
+            return
+        if not torch.cuda.is_available():
+            logger.info("GPU memory fraction %s requested but CUDA is not available; ignoring", fraction)
+            return
+        torch.cuda.set_per_process_memory_fraction(fraction)
+        logger.info("Set per-process GPU memory fraction to %s", fraction)
+    
+    @property
+    def gpu_available(self) -> bool:
+        """Whether a CUDA GPU is visible to torch (False if torch is not installed)."""
+        if self._gpu_available is None:
+            try:
+                torch = importlib.import_module("torch")
+                self._gpu_available = bool(torch.cuda.is_available())
+            except Exception:
+                self._gpu_available = False
+        return self._gpu_available
     
     @property
     def model(self) -> Any:
@@ -365,9 +436,10 @@ class MLController(ABC):
     
     def health_check(self) -> Dict[str, Any]:
         """Return health check information."""
+        ready = self._ready and self.is_loaded
         return {
-            "status": "healthy" if self.is_loaded else "not_ready",
-            "model_loaded": self.is_loaded,
+            "status": "healthy" if ready else "not_ready",
+            "model_loaded": ready,
             "model_name": self.model_name,
             "version": self.model_version,
         }
@@ -381,6 +453,12 @@ class MLController(ABC):
         async def lifespan(app: FastAPI):
             # Startup: Initialize controller
             logger.info(f"Initializing {controller.model_name}...")
+            if controller.request_model is None:
+                logger.warning(
+                    f"{controller.model_name}: request_model is not set, so the request schema "
+                    "is the generic `data: Any`. Set request_model to a Pydantic model so "
+                    "clients can discover the expected input via GET /schema."
+                )
             try:
                 controller._initialize()
             except Exception as e:
@@ -417,12 +495,21 @@ class MLController(ABC):
             @app.get(
                 "/health",
                 response_model=HealthResponse,
+                responses={503: {"model": HealthResponse, "description": "Model not loaded"}},
                 tags=["Health"],
                 summary="Health Check",
             )
-            async def health():
-                """Check the health status of the model."""
-                return controller.health_check()
+            async def health(response: Response):
+                """Readiness: 200 once the model is loaded, 503 otherwise."""
+                result = controller.health_check()
+                if result.get("status") != "healthy":
+                    response.status_code = 503
+                return result
+            
+            @app.get("/livez", tags=["Health"], summary="Liveness Check")
+            async def livez():
+                """Liveness: 200 whenever the process is up, regardless of model state."""
+                return {"status": "alive"}
         
         # Root endpoint
         @app.get("/info", tags=["Info"])
@@ -432,11 +519,29 @@ class MLController(ABC):
                 "name": controller.model_name,
                 "version": controller.model_version,
                 "endpoint": "/predict",
+                "library_version": __version__,
+                "gpu_available": controller.gpu_available,
+            }
+        
+        RequestModel: Type[BaseModel] = self.request_model or PredictionRequest
+        ResponseModel: Type[BaseModel] = self.response_model or PredictionResponse
+        
+        # Schema endpoint
+        @app.get("/schema", tags=["Info"], summary="Input/Output Schema")
+        async def schema():
+            """JSON Schema of the request and response, plus optional examples."""
+            return {
+                "model_name": controller.model_name,
+                "model_version": controller.model_version,
+                "request_schema": RequestModel.model_json_schema(),
+                "response_schema": ResponseModel.model_json_schema(),
+                "example": {
+                    "request": controller.request_example,
+                    "response": controller.response_example,
+                },
             }
         
         # Predict endpoint
-        RequestModel: Type[BaseModel] = self.request_model or PredictionRequest
-        ResponseModel: Type[BaseModel] = self.response_model or PredictionResponse
         
         async def predict_endpoint(request: Request) -> Any:
             """Run prediction on the input data."""
@@ -524,8 +629,8 @@ class MLController(ABC):
     
     def run(
         self,
-        host: str = "0.0.0.0",
-        port: int = 8000,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
         reload: bool = False,
         **uvicorn_kwargs,
     ) -> None:
@@ -533,12 +638,21 @@ class MLController(ABC):
         Run the FastAPI server with Uvicorn.
         
         Args:
-            host: Host to bind to
-            port: Port to bind to
+            host: Host to bind to (default: $FASTMLAPI_HOST, else 0.0.0.0)
+            port: Port to bind to (default: $FASTMLAPI_PORT, else 8000)
             reload: Enable auto-reload
             **uvicorn_kwargs: Additional arguments passed to uvicorn.run
         """
         import uvicorn
+        
+        if host is None:
+            host = os.environ.get(ENV_HOST) or DEFAULT_HOST
+        if port is None:
+            raw_port = os.environ.get(ENV_PORT)
+            try:
+                port = int(raw_port) if raw_port else DEFAULT_PORT
+            except ValueError:
+                raise ValueError(f"Invalid {ENV_PORT}={raw_port!r}: expected an integer")
         
         print(f"Starting {self.model_name} v{self.model_version}...")
         print(f"API docs available at: http://{host}:{port}/docs")

@@ -182,8 +182,10 @@ Once running, your API provides:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/predict` | POST | Run predictions |
-| `/health` | GET | Health check status |
-| `/` | GET | API info |
+| `/health` | GET | Readiness: 200 when the model is loaded, 503 otherwise |
+| `/livez` | GET | Liveness: 200 whenever the process is up |
+| `/schema` | GET | JSON Schema of request/response plus optional examples |
+| `/info` | GET | Name, version, library version, GPU availability |
 | `/docs` | GET | Swagger UI documentation |
 | `/redoc` | GET | ReDoc documentation |
 
@@ -210,6 +212,121 @@ curl -X POST http://localhost:8000/predict \
   }
 }
 ```
+
+## Health, Schema and Deployment
+
+These features are generic and opt-in; they are what you need when the service runs in a
+container behind an orchestrator or gateway, but they are useful anywhere.
+A complete container example lives in [`examples/containerized/`](examples/containerized/).
+
+### Readiness and liveness
+
+| Endpoint | Meaning | Status |
+|----------|---------|--------|
+| `GET /health` | Readiness. Same `HealthResponse` body as always. | `200` when the model is loaded, `503` otherwise |
+| `GET /livez` | Liveness. | `200` whenever the process is up |
+
+Plain HTTP probes only look at the status code, so `/health` returns `503` (with the
+`"status": "not_ready"` body) until the model is loaded.
+
+**Model loading can be slow.** `setup()` and `load_model()` run during application startup,
+before the server accepts connections, so while a large model loads the port is not yet open
+(connection refused, not `503`). This is normal. Configure the orchestrator with a
+*startup probe* (for example Kubernetes `startupProbe` on `/health` with a generous
+`failureThreshold * periodSeconds`) so the container is not killed while loading, and use
+`/livez` for the liveness probe and `/health` for the readiness probe.
+
+### Schema endpoint
+
+`GET /schema` returns the JSON Schema of the request and response so clients can discover the
+expected input without reading your code:
+
+```json
+{
+  "model_name": "my-classifier",
+  "model_version": "1.0.0",
+  "request_schema": {"...": "JSON Schema of request_model"},
+  "response_schema": {"...": "JSON Schema of response_model"},
+  "example": {"request": {"features": [5.1, 3.5, 1.4, 0.2]}, "response": null}
+}
+```
+
+The schemas come from `request_model` / `response_model`, falling back to the default
+`PredictionRequest` / `PredictionResponse`. Set `request_example` / `response_example`
+(dict or `None`) to fill `example`.
+
+If `request_model` is not set, a **warning is logged at startup**: the default schema is just
+`data: Any`, which tells clients nothing. Define a typed model instead:
+
+```python
+from typing import List
+from pydantic import BaseModel, Field
+from fastmlapi import MLController
+
+class IrisRequest(BaseModel):
+    features: List[float] = Field(..., min_length=4, max_length=4,
+                                  description="sepal/petal length and width in cm")
+
+class IrisClassifier(MLController):
+    model_name = "iris"
+    request_model = IrisRequest
+    request_example = {"features": [5.1, 3.5, 1.4, 0.2]}
+```
+
+### Cache directory
+
+`self.cache_dir` (a `pathlib.Path`) is read from `FASTMLAPI_CACHE_DIR`
+(default `./.cache/fastmlapi`). It is created if missing before `setup()` runs, so it can be
+used in both `setup()` and `load_model()`. Mount a persistent volume there to keep downloads
+across restarts:
+
+```python
+import os
+
+class HFModel(MLController):
+    def load_model(self):
+        os.environ.setdefault("HF_HOME", str(self.cache_dir / "hf"))
+        from transformers import pipeline
+        return pipeline("text-classification", model="distilbert-base-uncased-finetuned-sst-2-english")
+```
+
+**Weights baked into the image vs. downloaded at startup:**
+
+- *Baked in*: fast, reproducible starts and no network needed at runtime, but large images,
+  slow pulls and a rebuild for every weight change.
+- *Downloaded into a persistent cache*: small images and weights updated independently of the
+  code, but the first start is slow, needs network access and credentials, and the cache
+  volume must be persistent (otherwise every restart re-downloads).
+
+### GPU memory cap (best effort)
+
+Set `gpu_memory_fraction = 0.5` on the class, or `FASTMLAPI_GPU_MEMORY_FRACTION=0.5` (the
+environment wins). If `torch` is installed and CUDA is available, fastmlapi calls
+`torch.cuda.set_per_process_memory_fraction(...)` before `setup()` and `load_model()`.
+Without torch or CUDA nothing happens (an info message is logged). Values outside `(0, 1]`
+raise `ValueError` at startup. This only limits PyTorch's caching allocator; other frameworks
+(TensorFlow, JAX, ONNX Runtime, ...) need their own settings.
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FASTMLAPI_HOST` | `0.0.0.0` | Default bind host for `run()` |
+| `FASTMLAPI_PORT` | `8000` | Default bind port for `run()` |
+| `FASTMLAPI_CACHE_DIR` | `./.cache/fastmlapi` | Persistent cache directory (`self.cache_dir`) |
+| `FASTMLAPI_GPU_MEMORY_FRACTION` | unset | Overrides `gpu_memory_fraction` |
+
+Arguments passed explicitly to `run(host=..., port=...)` take priority over the environment.
+
+### Graceful shutdown
+
+`run()` uses Uvicorn, which handles `SIGTERM` (what Docker and Kubernetes send on stop) by
+finishing in-flight requests and running application shutdown before the process exits.
+Pass e.g. `timeout_graceful_shutdown=20` to `run()` to bound the wait, and keep the
+orchestrator's grace period (`docker stop -t`, Kubernetes `terminationGracePeriodSeconds`)
+longer than that. Note that Uvicorn re-raises the signal after shutting down, so the exit
+status is typically 143 (`128 + SIGTERM`) rather than 0. In a Dockerfile use the exec form
+of `CMD` so Python is PID 1 and receives the signal.
 
 ## Advanced Usage
 
@@ -429,15 +546,18 @@ class KerasClassifier(MLController):
 | `api_version` | str | `"1.0.0"` | API version |
 | `request_model` | BaseModel | `PredictionRequest` | Custom Pydantic request model |
 | `response_model` | BaseModel | `PredictionResponse` | Custom Pydantic response model |
-| `enable_health` | bool | `True` | Enable `/health` endpoint |
+| `request_example` | dict \| None | `None` | Example request body, shown by `/schema` |
+| `response_example` | dict \| None | `None` | Example response body, shown by `/schema` |
+| `gpu_memory_fraction` | float \| None | `None` | Optional GPU memory cap, `0 < x <= 1` (see below) |
+| `enable_health` | bool | `True` | Enable `/health` and `/livez` endpoints |
 | `enable_docs` | bool | `True` | Enable Swagger/OpenAPI docs |
 
 ### run() Method Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `host` | str | `"0.0.0.0"` | Host to bind to |
-| `port` | int | `8000` | Port to bind to |
+| `host` | str | `$FASTMLAPI_HOST`, else `"0.0.0.0"` | Host to bind to |
+| `port` | int | `$FASTMLAPI_PORT`, else `8000` | Port to bind to |
 | `reload` | bool | `False` | Enable auto-reload (dev only) |
 | `**uvicorn_kwargs` | dict | `{}` | Additional Uvicorn options |
 

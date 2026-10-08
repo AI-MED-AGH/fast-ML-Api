@@ -81,3 +81,6 @@ venv.bak/
 *.pth
 *.h5
 *.onnx
+
+# fastmlapi default cache dir
+.cache/
