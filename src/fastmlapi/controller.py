@@ -136,6 +136,12 @@ class MLController(ABC):
     # Enable/disable features
     enable_health: bool = True
     enable_docs: bool = True
+
+    # Job queue tuning (only used in queue mode / by workers)
+    result_ttl: float = 3600.0          # seconds a finished job's result is kept
+    visibility_timeout: float = 30.0    # seconds without a heartbeat before a job is requeued
+    max_attempts: int = 3               # claims before a job is failed as "worker lost"
+    heartbeat_interval: float = 5.0     # seconds between worker heartbeats
     
     def __init__(self):
         self._model = None

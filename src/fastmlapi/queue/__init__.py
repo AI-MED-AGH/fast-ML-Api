@@ -11,6 +11,7 @@ from .backend import (
 )
 from .memory_backend import MemoryBackend
 from .redis_backend import RedisBackend
+from .worker import Worker
 
 __all__ = [
     "FAILED",
@@ -22,4 +23,5 @@ __all__ = [
     "QueueBackend",
     "QueueUnavailable",
     "RedisBackend",
+    "Worker",
 ]
