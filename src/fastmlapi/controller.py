@@ -7,14 +7,17 @@ from typing import Any, Dict, Optional, Type, Callable
 import importlib
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from ._version import __version__
+from .queue.backend import QueueBackend, QueueUnavailable
 from .types import (
     PredictionRequest,
     PredictionResponse,
@@ -157,6 +160,7 @@ class MLController(ABC):
         self._prediction_fn: Optional[Callable] = None
         self._custom_routes: list = []
         self._app: Optional[FastAPI] = None
+        self._queue_backend: Optional[QueueBackend] = None
         self._discover_processors()
     
     def _discover_processors(self) -> None:
@@ -366,6 +370,55 @@ class MLController(ABC):
             **kwargs,
         })
     
+    def use_queue(self, backend: QueueBackend) -> None:
+        """Run in queue mode: `/jobs` replaces `/predict` and this process
+        does not load the model (start workers with `run_worker()`).
+
+        Must be called before the app is created.
+        """
+        if self._app is not None:
+            raise RuntimeError(
+                "Cannot enable the job queue after the app has been created. "
+                "Call use_queue() (or run(queue_url=...)) before accessing .app"
+            )
+        self._queue_backend = backend
+
+    def _redis_backend(self, url: str) -> QueueBackend:
+        from .queue.redis_backend import RedisBackend
+
+        return RedisBackend(
+            url, prefix=f"fastmlapi:{self.model_name}:", result_ttl=self.result_ttl
+        )
+
+    def _initialize_api_only(self) -> None:
+        """Queue-mode API startup: no model, workers load it."""
+        logger.info("Initializing controller (queue mode, model not loaded)")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.setup()
+        self._ready = True
+
+    def run_worker(
+        self,
+        redis_url: Optional[str] = None,
+        *,
+        backend: Optional[QueueBackend] = None,
+        **worker_kwargs: Any,
+    ) -> None:
+        """Run a queue worker in this process: load the model, then process
+        jobs until SIGINT/SIGTERM. Exits non-zero if startup fails."""
+        if backend is None:
+            if redis_url is None:
+                raise ValueError("run_worker() needs redis_url (or backend=)")
+            backend = self._redis_backend(redis_url)
+        from .queue.worker import Worker
+
+        print(f"Starting worker for {self.model_name} v{self.model_version}...")
+        try:
+            Worker(self, backend, **worker_kwargs).run()
+        except Exception:
+            logger.exception("Worker stopped: failed to start or fatal error")
+            sys.exit(1)
+
     def preprocess(self, data: Any) -> Any:
         """
         Default preprocessing - returns data as-is.
@@ -442,6 +495,20 @@ class MLController(ABC):
     
     def health_check(self) -> Dict[str, Any]:
         """Return health check information."""
+        backend = self._queue_backend
+        if backend is not None:
+            try:
+                connected = backend.ping()
+                depth = backend.pending_count() if connected else None
+            except QueueUnavailable:
+                connected, depth = False, None
+            return {
+                "status": "healthy" if connected else "not_ready",
+                "model_name": self.model_name,
+                "version": self.model_version,
+                "queue_connected": connected,
+                "queue_depth": depth,
+            }
         ready = self._ready and self.is_loaded
         return {
             "status": "healthy" if ready else "not_ready",
@@ -466,7 +533,10 @@ class MLController(ABC):
                     "clients can discover the expected input via GET /schema."
                 )
             try:
-                controller._initialize()
+                if controller._queue_backend is not None:
+                    controller._initialize_api_only()
+                else:
+                    controller._initialize()
             except Exception as e:
                 logger.error(f"Failed to initialize {controller.model_name}: {e}")
                 raise
@@ -501,13 +571,14 @@ class MLController(ABC):
             @app.get(
                 "/health",
                 response_model=HealthResponse,
+                response_model_exclude_none=True,
                 responses={503: {"model": HealthResponse, "description": "Model not loaded"}},
                 tags=["Health"],
                 summary="Health Check",
             )
             async def health(response: Response):
                 """Readiness: 200 once the model is loaded, 503 otherwise."""
-                result = controller.health_check()
+                result = await run_in_threadpool(controller.health_check)
                 if result.get("status") != "healthy":
                     response.status_code = 503
                 return result
@@ -524,7 +595,7 @@ class MLController(ABC):
             return {
                 "name": controller.model_name,
                 "version": controller.model_version,
-                "endpoint": "/predict",
+                "endpoint": "/jobs" if controller._queue_backend is not None else "/predict",
                 "library_version": __version__,
                 "gpu_available": controller.gpu_available,
             }
@@ -547,6 +618,35 @@ class MLController(ABC):
                 },
             }
         
+        if self._queue_backend is not None:
+            from .queue.api import register_queue_routes
+
+            register_queue_routes(app, self, self._queue_backend, RequestModel)
+        else:
+            self._register_predict_route(app, RequestModel, ResponseModel)
+        
+        # Register custom routes
+        for route_config in self._custom_routes:
+            endpoint = route_config.pop("endpoint")
+            path = route_config.pop("path")
+            methods = route_config.pop("methods", ["GET"])
+            
+            app.add_api_route(
+                path,
+                endpoint,
+                methods=methods,
+                **route_config,
+            )
+            logger.debug(f"Registered custom route: {methods} {path}")
+        
+        return app
+    
+    def _register_predict_route(
+        self,
+        app: FastAPI,
+        RequestModel: Type[BaseModel],
+        ResponseModel: Type[BaseModel],
+    ) -> None:
         # Predict endpoint
         
         async def predict_endpoint(request: Request) -> Any:
@@ -564,18 +664,18 @@ class MLController(ABC):
                     data = validated_request.model_dump()
                 
                 # Run prediction pipeline
-                result = await controller.predict(data)
+                result = await self.predict(data)
                 
                 # Build response
-                if controller.response_model:
+                if self.response_model:
                     return result
                 
                 return PredictionResponse(
                     success=True,
                     prediction=result,
                     metadata={
-                        "model_name": controller.model_name,
-                        "model_version": controller.model_version,
+                        "model_name": self.model_name,
+                        "model_version": self.model_version,
                     },
                 )
                 
@@ -609,22 +709,6 @@ class MLController(ABC):
                 }
             },
         )
-        
-        # Register custom routes
-        for route_config in self._custom_routes:
-            endpoint = route_config.pop("endpoint")
-            path = route_config.pop("path")
-            methods = route_config.pop("methods", ["GET"])
-            
-            app.add_api_route(
-                path,
-                endpoint,
-                methods=methods,
-                **route_config,
-            )
-            logger.debug(f"Registered custom route: {methods} {path}")
-        
-        return app
     
     @property
     def app(self) -> FastAPI:
@@ -638,6 +722,7 @@ class MLController(ABC):
         host: Optional[str] = None,
         port: Optional[int] = None,
         reload: bool = False,
+        queue_url: Optional[str] = None,
         **uvicorn_kwargs,
     ) -> None:
         """
@@ -647,9 +732,13 @@ class MLController(ABC):
             host: Host to bind to (default: $FASTMLAPI_HOST, else 0.0.0.0)
             port: Port to bind to (default: $FASTMLAPI_PORT, else 8000)
             reload: Enable auto-reload
+            queue_url: Redis URL; enables queue mode (see use_queue)
             **uvicorn_kwargs: Additional arguments passed to uvicorn.run
         """
         import uvicorn
+        
+        if queue_url is not None:
+            self.use_queue(self._redis_backend(queue_url))
         
         if host is None:
             host = os.environ.get(ENV_HOST) or DEFAULT_HOST
@@ -662,7 +751,10 @@ class MLController(ABC):
         
         print(f"Starting {self.model_name} v{self.model_version}...")
         print(f"API docs available at: http://{host}:{port}/docs")
-        print(f"Predict endpoint: POST http://{host}:{port}/predict")
+        if self._queue_backend is not None:
+            print(f"Jobs endpoint: POST http://{host}:{port}/jobs")
+        else:
+            print(f"Predict endpoint: POST http://{host}:{port}/predict")
         
         uvicorn.run(
             self.app,

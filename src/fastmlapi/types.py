@@ -50,6 +50,28 @@ class HealthResponse(BaseModel):
     """Health check response model."""
     
     status: str = Field(default="healthy")
-    model_loaded: bool = Field(default=False)
+    model_loaded: Optional[bool] = Field(default=None)
     model_name: Optional[str] = Field(default=None)
     version: Optional[str] = Field(default=None)
+    queue_connected: Optional[bool] = Field(default=None)
+    queue_depth: Optional[int] = Field(default=None)
+
+
+class JobSubmitResponse(BaseModel):
+    """Returned by POST /jobs."""
+
+    job_id: str
+
+
+class JobStatusResponse(BaseModel):
+    """Returned by GET /jobs/{job_id}."""
+
+    job_id: str
+    status: str = Field(description="queued, running, succeeded or failed")
+    result: Any = None
+    error: Optional[str] = None
+    error_type: Optional[str] = None
+    attempts: int = 0
+    created_at: Optional[float] = None
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
