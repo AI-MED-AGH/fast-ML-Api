@@ -66,14 +66,17 @@ return 1
 # KEYS: job, processing:{worker}, pending
 # ARGV: now, visibility timeout, max attempts, job id, ttl
 # returns 0 untouched, 1 requeued, 2 failed (worker lost)
+# The id list is read outside this script, so every decision is re-checked
+# here: the job must still be running and stale, and must still be listed
+# under this worker. Only the sweeper that removes the id acts on it.
 _REQUEUE_IF_STALE = """
-local hb = tonumber(redis.call('HGET', KEYS[1], 'heartbeat'))
-if not hb then
+if redis.call('HGET', KEYS[1], 'status') ~= 'running' then
   redis.call('LREM', KEYS[2], 0, ARGV[4])
   return 0
 end
+local hb = tonumber(redis.call('HGET', KEYS[1], 'heartbeat') or '0')
 if tonumber(ARGV[1]) - hb <= tonumber(ARGV[2]) then return 0 end
-redis.call('LREM', KEYS[2], 0, ARGV[4])
+if redis.call('LREM', KEYS[2], 0, ARGV[4]) == 0 then return 0 end
 local attempts = tonumber(redis.call('HGET', KEYS[1], 'attempts') or '0')
 if attempts >= tonumber(ARGV[3]) then
   redis.call('HSET', KEYS[1], 'status', 'failed',

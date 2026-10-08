@@ -177,6 +177,30 @@ def test_requeue_stale_fails_job_after_max_attempts(env):
     assert b.pending_count() == 0
 
 
+def test_requeue_stale_twice_requeues_once(env):
+    b = env.backend
+    job_id = b.enqueue({})
+    b.claim("w1")
+    env.clock.advance(31)
+    assert b.requeue_stale(30, 3) == 1
+    assert b.requeue_stale(30, 3) == 0
+    assert b.pending_count() == 1
+    assert b.get_job(job_id).status == "queued"
+
+
+def test_completed_job_is_not_resurrected_by_requeue_stale(env):
+    b = env.backend
+    job_id = b.enqueue({})
+    b.claim("w1")
+    env.clock.advance(31)  # the heartbeat is now stale...
+    assert b.complete("w1", job_id, "done") is True  # ...but the worker finishes
+    assert b.requeue_stale(30, 3) == 0
+    job = b.get_job(job_id)
+    assert job.status == "succeeded"
+    assert job.result == "done"
+    assert b.pending_count() == 0
+
+
 def test_zombie_worker_cannot_overwrite_new_owner(env):
     b = env.backend
     job_id = b.enqueue({})
