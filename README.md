@@ -533,6 +533,58 @@ class KerasClassifier(MLController):
         }
 ```
 
+## Long-running jobs (queue mode)
+
+For slow or heavy inference, move the model out of the API process. The API accepts a job and returns immediately; worker processes (same or other machines) take jobs from Redis, run your pipeline and store the result. Clients submit, then poll.
+
+```bash
+pip install fastmlapi[queue]
+```
+
+Write one `MLController` subclass and start it in either role:
+
+```python
+if __name__ == "__main__":
+    controller = MyModel()
+    if sys.argv[1:] == ["worker"]:
+        controller.run_worker(redis_url="redis://localhost:6379/0")
+    else:
+        controller.run(queue_url="redis://localhost:6379/0")
+```
+
+See [`examples/queue_worker.py`](examples/queue_worker.py) for a complete example. Start as many workers as you need; they scale horizontally against the same Redis.
+
+### Endpoints
+
+| Endpoint | Behaviour |
+|----------|-----------|
+| `POST /jobs` | Validates the body against `request_model` (422 if invalid), enqueues it and returns `202 {"job_id": "..."}`. 503 if Redis is unreachable. |
+| `GET /jobs/{id}` | Returns `status` (`queued`, `running`, `succeeded` or `failed`) plus `result` (succeeded) or `error` / `error_type` (failed), and `attempts`, `created_at`, `started_at`, `finished_at`. 404 if unknown or expired. |
+| `GET /health` | 200 when the queue backend is reachable, 503 otherwise; includes `queue_connected` and `queue_depth`. `model_loaded` is omitted. |
+
+`/predict` is not available in queue mode, and the API process does not load the model (`setup()` still runs). Workers run `setup()` and `load_model()` at startup and exit non-zero if they fail.
+
+### Tuning
+
+Override these class attributes on your controller:
+
+| Attribute | Default | Description |
+|-----------|---------|-------------|
+| `result_ttl` | `3600` | Seconds a finished job (result or error) is kept |
+| `visibility_timeout` | `30` | Seconds without a heartbeat before a running job is considered lost and requeued |
+| `max_attempts` | `3` | Times a job may be claimed; after that a lost job is marked `failed` |
+| `heartbeat_interval` | `5` | Seconds between worker heartbeats |
+
+### Caveats
+
+- **At-least-once delivery.** A job can run twice if a worker dies after finishing but before saving the result. Make inference idempotent where that matters.
+- **No hard per-job timeout.** Python cannot safely interrupt a running model, so a stuck job keeps its worker busy. Run time does not matter as long as heartbeats continue.
+- **Heartbeats and the GIL.** A long CPU-bound call that never releases the GIL can delay heartbeats; if jobs get requeued while still running, raise `visibility_timeout`.
+- **Results must be JSON-serializable.** Otherwise the job fails with a serialization error.
+- **Results expire.** Finished jobs are deleted after `result_ttl`.
+- **Crash recovery is done by workers, not the API.** Workers requeue jobs of dead workers when they sweep. The sweep runs between jobs (at the start of each claim attempt, at most every `sweep_interval`, default `max(visibility_timeout / 2, 1)` seconds). If every worker is busy with a long job, a dead worker's job is recovered once one of them becomes free; if all workers are dead, it is recovered when a worker starts.
+- **Worker ids must be unique per process.** Completion, failure and heartbeats are fenced by worker id, so a worker that lost its job cannot overwrite the new owner. The default id (`hostname-pid-random`) is unique per process; if you pass a custom `worker_id`, keep it unique.
+
 ## Configuration Reference
 
 ### MLController Class Attributes
@@ -559,6 +611,7 @@ class KerasClassifier(MLController):
 | `host` | str | `$FASTMLAPI_HOST`, else `"0.0.0.0"` | Host to bind to |
 | `port` | int | `$FASTMLAPI_PORT`, else `8000` | Port to bind to |
 | `reload` | bool | `False` | Enable auto-reload (dev only) |
+| `queue_url` | str \| None | `None` | Redis URL; enables queue mode (see above) |
 | `**uvicorn_kwargs` | dict | `{}` | Additional Uvicorn options |
 
 ## Development

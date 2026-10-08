@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Queue mode for long-running inference: `run(queue_url=...)` serves `POST /jobs` and `GET /jobs/{id}` and does not load the model; `run_worker(redis_url=...)` runs a worker. Redis-backed (`pip install fastmlapi[queue]`), with heartbeats, crash recovery and graceful shutdown.
+- `fastmlapi.queue` package: `QueueBackend`, `MemoryBackend`, `RedisBackend`, `Worker`
+- `result_ttl`, `visibility_timeout`, `max_attempts`, `heartbeat_interval` class attributes
+- `HealthResponse.queue_connected` / `queue_depth` (queue mode only)
+
+### Changed
+
+- `HealthResponse.model_loaded` is now optional (omitted in queue mode); sync-mode output is unchanged
+
 ## [0.2.0] - 2026-10-08
 
 ### Added
