@@ -136,10 +136,12 @@ class Worker:
             except Exception as exc:
                 logger.exception("Job %s failed", job.id)
                 outcome = ("fail", str(exc), type(exc).__name__)
+            # Keep heartbeating until the result is saved (or abandoned), so a
+            # long Redis outage while saving does not get the job requeued.
+            self._finish(job, outcome)
         finally:
             stop_heartbeat.set()
             beat.join()
-        self._finish(job, outcome)
 
     def _job_input(self, job: Job) -> Any:
         """Re-validate the stored request body and extract the model input
@@ -191,10 +193,15 @@ class Worker:
         while not stop.wait(self.controller.heartbeat_interval):
             try:
                 if not self.backend.heartbeat(self.worker_id, job_id):
-                    logger.warning("Job %s is no longer owned by this worker", job_id)
+                    if not stop.is_set():  # not just our own result write
+                        logger.warning("Job %s is no longer owned by this worker", job_id)
                     return
             except QueueUnavailable:
                 logger.warning("Heartbeat for job %s failed: queue unavailable", job_id)
+            except Exception:
+                # Never let the heartbeat die while the job runs, or the job
+                # is requeued after visibility_timeout and runs twice.
+                logger.exception("Heartbeat for job %s failed", job_id)
 
     def _install_signal_handlers(self) -> Callable[[], None]:
         if threading.current_thread() is not threading.main_thread():

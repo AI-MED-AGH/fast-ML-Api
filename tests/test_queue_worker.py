@@ -203,3 +203,71 @@ def test_payload_that_fails_request_validation_fails_the_job_and_worker_keeps_go
     assert "data" in failed.error
     assert worker.run_once() is True
     assert backend.get_job(good).result == {"doubled": 4}
+
+
+def test_heartbeat_thread_survives_an_unexpected_error():
+    class Glitchy(MemoryBackend):
+        calls = 0
+        ok_after_error = 0
+
+        def heartbeat(self, worker_id, job_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("READONLY You can't write against a read only replica")
+            self.ok_after_error += 1
+            return super().heartbeat(worker_id, job_id)
+
+    class Slow(Doubler):
+        heartbeat_interval = 0.02
+        backend = None
+        job_id = None
+        seen = None
+
+        @prediction
+        def infer(self, n):
+            time.sleep(0.1)  # the first (failing) beat happens in here
+            first = self.backend.get_job(self.job_id).heartbeat
+            time.sleep(0.2)
+            self.seen = (first, self.backend.get_job(self.job_id).heartbeat)
+            return n
+
+    controller = Slow()
+    backend = Glitchy()
+    controller.backend = backend
+    controller.job_id = backend.enqueue({"data": {"n": 1}})
+    _, _, worker = make_worker(controller, backend)
+    worker.run_once()
+    assert backend.ok_after_error >= 2
+    first, later = controller.seen
+    assert later > first
+    assert backend.get_job(controller.job_id).status == "succeeded"
+
+
+def test_heartbeat_keeps_running_while_the_result_write_is_retried():
+    class SlowSave(MemoryBackend):
+        failures = 3
+        saving = False
+        beats_while_saving = 0
+
+        def complete(self, worker_id, job_id, result):
+            self.saving = True
+            if self.failures > 0:
+                self.failures -= 1
+                raise QueueUnavailable("down")
+            return super().complete(worker_id, job_id, result)
+
+        def heartbeat(self, worker_id, job_id):
+            if self.saving:
+                self.beats_while_saving += 1
+            return super().heartbeat(worker_id, job_id)
+
+    class Fast(Doubler):
+        heartbeat_interval = 0.01
+
+    backend = SlowSave()
+    job_id = backend.enqueue({"data": {"n": 2}})
+    # the result write is retried for ~0.05 + 0.1 + 0.2 s
+    _, _, worker = make_worker(Fast(), backend, backoff_initial=0.05)
+    worker.run_once()
+    assert backend.get_job(job_id).status == "succeeded"
+    assert backend.beats_while_saving > 0
