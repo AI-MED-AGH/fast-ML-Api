@@ -281,3 +281,17 @@ def test_request_model_without_data_gets_real_python_types_in_the_worker():
     assert isinstance(WhenYear.seen[-1]["when"], datetime)
     assert _run_sync(WhenYear, body) == {"result": 2025}
     assert WhenYear.seen[0] == WhenYear.seen[1]
+
+
+def test_use_queue_accepts_a_redis_url_with_the_model_name_prefix(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        "fastmlapi.queue.redis_backend.RedisBackend",
+        lambda url, **kw: seen.update(url=url, **kw) or MemoryBackend(),
+    )
+    ctrl = Doubler()
+    ctrl.use_queue("redis://example:6379/0")
+    assert seen["url"] == "redis://example:6379/0"
+    assert seen["prefix"] == "fastmlapi:doubler:"
+    assert isinstance(ctrl._queue_backend, MemoryBackend)
+    assert any(getattr(r, "path", None) == "/jobs" for r in ctrl.app.routes)

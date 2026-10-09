@@ -3,7 +3,7 @@ MLController - Unified ML model controller with built-in FastAPI server.
 """
 
 from abc import ABC
-from typing import Any, Dict, Optional, Type, Callable
+from typing import Any, Dict, Optional, Type, Callable, Union
 import importlib
 import logging
 import os
@@ -370,10 +370,12 @@ class MLController(ABC):
             **kwargs,
         })
     
-    def use_queue(self, backend: QueueBackend) -> None:
+    def use_queue(self, backend: Union[str, QueueBackend]) -> None:
         """Run in queue mode: `/jobs` replaces `/predict` and this process
         does not load the model (start workers with `run_worker()`).
 
+        `backend` is a Redis URL (keys prefixed `fastmlapi:{model_name}:`,
+        the same keys `run_worker(redis_url=...)` uses) or a QueueBackend.
         Must be called before the app is created.
         """
         if self._app is not None:
@@ -381,6 +383,8 @@ class MLController(ABC):
                 "Cannot enable the job queue after the app has been created. "
                 "Call use_queue() (or run(queue_url=...)) before accessing .app"
             )
+        if isinstance(backend, str):
+            backend = self._redis_backend(backend)
         self._queue_backend = backend
 
     def _redis_backend(self, url: str) -> QueueBackend:
@@ -743,7 +747,7 @@ class MLController(ABC):
         import uvicorn
         
         if queue_url is not None:
-            self.use_queue(self._redis_backend(queue_url))
+            self.use_queue(queue_url)
         
         if host is None:
             host = os.environ.get(ENV_HOST) or DEFAULT_HOST
