@@ -186,3 +186,16 @@ def test_requeue_stale_finds_jobs_when_the_prefix_has_glob_characters():
     finally:
         for key in b._r.scan_iter(match=_glob_escape(prefix) + "*"):
             b._r.delete(key)
+
+
+def test_unix_socket_urls_do_not_get_a_connect_timeout():
+    # redis-py 4.x UnixDomainSocketConnection rejects socket_connect_timeout
+    # (TypeError at connect time), so only socket_timeout is passed.
+    pytest.importorskip("redis")
+    from fastmlapi.queue.redis_backend import RedisBackend
+
+    b = RedisBackend("unix:///tmp/fastmlapi-nonexistent.sock")
+    kw = b._r.connection_pool.connection_kwargs
+    assert kw["socket_timeout"] == 5.0
+    assert "socket_connect_timeout" not in kw
+    assert b.ping() is False

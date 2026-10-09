@@ -153,15 +153,13 @@ class RedisBackend(QueueBackend):
             ) from exc
         # Without timeouts (redis-py < 8 default) a partitioned Redis hangs
         # /health, /jobs and workers. Options set in the URL take precedence.
-        in_url = parse_qs(urlparse(url).query)
-        timeouts = {
-            name: value
-            for name, value in (
-                ("socket_timeout", socket_timeout),
-                ("socket_connect_timeout", socket_connect_timeout),
-            )
-            if name not in in_url
-        }
+        parsed = urlparse(url)
+        in_url = parse_qs(parsed.query)
+        options = [("socket_timeout", socket_timeout)]
+        if parsed.scheme != "unix":
+            # redis-py 4.x unix-socket connections reject this keyword
+            options.append(("socket_connect_timeout", socket_connect_timeout))
+        timeouts = {name: value for name, value in options if name not in in_url}
         self._r = redis.Redis.from_url(url, decode_responses=True, **timeouts)
         self._redis_errors = redis.exceptions.RedisError
         self._prefix = prefix
