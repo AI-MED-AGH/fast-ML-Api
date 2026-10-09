@@ -54,7 +54,7 @@ def test_run_once_returns_false_when_queue_is_empty():
 
 def test_run_once_processes_a_job():
     _, backend, worker = make_worker()
-    job_id = backend.enqueue({"n": 4})
+    job_id = backend.enqueue({"data": {"n": 4}})
     assert worker.run_once() is True
     job = backend.get_job(job_id)
     assert job.status == "succeeded"
@@ -63,8 +63,8 @@ def test_run_once_processes_a_job():
 
 def test_model_exception_fails_the_job_and_the_worker_keeps_going():
     _, backend, worker = make_worker()
-    bad = backend.enqueue({"n": 0})
-    good = backend.enqueue({"n": 1})
+    bad = backend.enqueue({"data": {"n": 0}})
+    good = backend.enqueue({"data": {"n": 1}})
     worker.run_once()
     worker.run_once()
     failed = backend.get_job(bad)
@@ -81,7 +81,7 @@ def test_unserializable_result_fails_the_job_instead_of_leaving_it_running():
             return {"obj": object()}
 
     _, backend, worker = make_worker(Unserializable())
-    job_id = backend.enqueue({"n": 1})
+    job_id = backend.enqueue({"data": {"n": 1}})
     worker.run_once()
     job = backend.get_job(job_id)
     assert job.status == "failed"
@@ -105,7 +105,7 @@ def test_heartbeat_is_refreshed_while_a_job_runs():
     controller = Slow()
     backend = MemoryBackend()
     controller.backend = backend
-    controller.job_id = backend.enqueue({"n": 1})
+    controller.job_id = backend.enqueue({"data": {"n": 1}})
     _, _, worker = make_worker(controller, backend)
     worker.run_once()
     first, later = controller.seen
@@ -119,7 +119,7 @@ def test_run_loop_processes_jobs_until_stopped():
     thread = threading.Thread(target=worker.run)
     thread.start()
     try:
-        ids = [backend.enqueue({"n": i + 1}) for i in range(3)]
+        ids = [backend.enqueue({"data": {"n": i + 1}}) for i in range(3)]
         assert wait_for(lambda: all(backend.get_job(i).status == "succeeded" for i in ids))
     finally:
         worker.stop()
@@ -138,7 +138,7 @@ def test_stop_lets_the_current_job_finish():
     worker = Worker(Slow(), backend, poll_interval=0.01)
     thread = threading.Thread(target=worker.run)
     thread.start()
-    job_id = backend.enqueue({"n": 1})
+    job_id = backend.enqueue({"data": {"n": 1}})
     assert wait_for(lambda: backend.get_job(job_id).status == "running")
     worker.stop()
     thread.join(timeout=5)
@@ -158,7 +158,7 @@ def test_startup_failure_propagates():
 def test_worker_requeues_jobs_abandoned_by_dead_workers():
     clock = FakeClock()
     backend = MemoryBackend(clock=clock)
-    job_id = backend.enqueue({"n": 5})
+    job_id = backend.enqueue({"data": {"n": 5}})
     backend.claim("dead-worker")
     clock.advance(100)  # far beyond visibility_timeout (30)
     _, _, worker = make_worker(backend=backend, sweep_interval=0)
@@ -179,7 +179,7 @@ def test_queue_outage_is_retried_with_backoff():
             return super().claim(worker_id)
 
     backend = Flaky()
-    job_id = backend.enqueue({"n": 3})
+    job_id = backend.enqueue({"data": {"n": 3}})
     worker = Worker(
         Doubler(), backend, poll_interval=0.01, backoff_initial=0.01, backoff_max=0.05
     )
@@ -190,3 +190,16 @@ def test_queue_outage_is_retried_with_backoff():
     finally:
         worker.stop()
         thread.join(timeout=5)
+
+
+def test_payload_that_fails_request_validation_fails_the_job_and_worker_keeps_going():
+    _, backend, worker = make_worker()
+    bad = backend.enqueue({"n": 1})  # no `data`: invalid for PredictionRequest
+    good = backend.enqueue({"data": {"n": 2}})
+    assert worker.run_once() is True
+    failed = backend.get_job(bad)
+    assert failed.status == "failed"
+    assert failed.error_type == "ValidationError"
+    assert "data" in failed.error
+    assert worker.run_once() is True
+    assert backend.get_job(good).result == {"doubled": 4}

@@ -128,8 +128,9 @@ class Worker:
         outcome: Tuple[Any, ...]
         try:
             try:
+                data = self._job_input(job)
                 result = self._get_loop().run_until_complete(
-                    self.controller.predict(job.payload)
+                    self.controller.predict(data)
                 )
                 outcome = ("complete", result)
             except Exception as exc:
@@ -139,6 +140,15 @@ class Worker:
             stop_heartbeat.set()
             beat.join()
         self._finish(job, outcome)
+
+    def _job_input(self, job: Job) -> Any:
+        """Re-validate the stored request body and extract the model input
+        the same way the sync /predict endpoint does."""
+        from ..types import PredictionRequest
+
+        request_model = self.controller.request_model or PredictionRequest
+        validated = request_model.model_validate(job.payload)
+        return self.controller._request_to_input(validated)
 
     def _finish(self, job: Job, outcome: Tuple[Any, ...]) -> None:
         if outcome[0] == "complete":

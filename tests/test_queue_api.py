@@ -1,8 +1,11 @@
 """API and controller integration for queue mode."""
 
+from datetime import datetime
+
 import uvicorn
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 
 from fastmlapi import MLController, postprocessing, prediction, preprocessing
 from fastmlapi.queue.backend import QueueUnavailable
@@ -188,3 +191,93 @@ def test_run_worker_exits_nonzero_when_the_model_cannot_load():
     with pytest.raises(SystemExit) as excinfo:
         Broken().run_worker(backend=MemoryBackend())
     assert excinfo.value.code == 1
+
+
+# -- same model input as /predict (sync and queue mode agree) ---------------
+
+
+class Inner(BaseModel):
+    n: int
+
+
+class NestedRequest(BaseModel):
+    data: Inner
+
+
+class NestedDoubler(MLController):
+    model_name = "nested-doubler"
+    request_model = NestedRequest
+    seen = []
+
+    @preprocessing
+    def preprocess(self, data):
+        type(self).seen.append(data)
+        return data.n
+
+    @prediction
+    def infer(self, n):
+        return n * 2
+
+
+class WhenRequest(BaseModel):
+    when: datetime
+    n: int
+
+
+class WhenYear(MLController):
+    model_name = "when-year"
+    request_model = WhenRequest
+    seen = []
+
+    @preprocessing
+    def preprocess(self, data):
+        type(self).seen.append(data)
+        return data["when"].year + data["n"]
+
+    @prediction
+    def infer(self, x):
+        return x
+
+
+def _run_job(controller_cls, body):
+    backend = MemoryBackend()
+    api = controller_cls()
+    api.use_queue(backend)
+    worker_ctrl = controller_cls()
+    worker_ctrl._initialize()
+    worker = Worker(worker_ctrl, backend, poll_interval=0.01)
+    with TestClient(api.app) as client:
+        r = client.post("/jobs", json=body)
+        assert r.status_code == 202, r.text
+        job_id = r.json()["job_id"]
+        assert worker.run_once() is True
+        return client.get(f"/jobs/{job_id}").json()
+
+
+def _run_sync(controller_cls, body):
+    with TestClient(controller_cls().app) as client:
+        r = client.post("/predict", json=body)
+        assert r.status_code == 200, r.text
+        return r.json()["prediction"]
+
+
+def test_nested_data_model_reaches_preprocess_as_the_model_instance():
+    NestedDoubler.seen = []
+    job = _run_job(NestedDoubler, {"data": {"n": 3}})
+    assert job["status"] == "succeeded", job
+    assert job["result"] == {"result": 6}
+    assert isinstance(NestedDoubler.seen[-1], Inner)
+    # and it matches what sync /predict hands preprocess
+    assert _run_sync(NestedDoubler, {"data": {"n": 3}}) == {"result": 6}
+    assert isinstance(NestedDoubler.seen[-1], Inner)
+
+
+def test_request_model_without_data_gets_real_python_types_in_the_worker():
+    WhenYear.seen = []
+    body = {"when": "2024-05-01T12:00:00", "n": 1}
+    job = _run_job(WhenYear, body)
+    assert job["status"] == "succeeded", job
+    assert job["result"] == {"result": 2025}
+    assert isinstance(WhenYear.seen[-1]["when"], datetime)
+    assert _run_sync(WhenYear, body) == {"result": 2025}
+    assert WhenYear.seen[0] == WhenYear.seen[1]

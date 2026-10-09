@@ -31,12 +31,11 @@ def register_queue_routes(
         summary=f"Submit a {controller.model_name} job",
     )
     async def submit_job(body: request_model):  # type: ignore[valid-type]
-        if hasattr(body, "data"):
-            data = body.data  # type: ignore[attr-defined]
-        else:
-            data = body.model_dump(mode="json")  # type: ignore[attr-defined]
+        # The whole validated body is stored; the worker re-validates it so
+        # preprocess() gets exactly what /predict would give it.
+        payload = body.model_dump(mode="json")  # type: ignore[attr-defined]
         try:
-            job_id = await run_in_threadpool(backend.enqueue, data)
+            job_id = await run_in_threadpool(backend.enqueue, payload)
         except QueueUnavailable as exc:
             raise _unavailable(exc)
         return JobSubmitResponse(job_id=job_id)

@@ -419,6 +419,15 @@ class MLController(ABC):
             logger.exception("Worker stopped: failed to start or fatal error")
             sys.exit(1)
 
+    def _request_to_input(self, validated: BaseModel) -> Any:
+        """The model input for a validated request (shared by /predict and
+        queue workers): `.data` if the request model has it, else the whole
+        request as a dict."""
+        if hasattr(validated, 'data'):
+            return getattr(validated, 'data')
+        # If custom request model, pass the whole request
+        return validated.model_dump()
+
     def preprocess(self, data: Any) -> Any:
         """
         Default preprocessing - returns data as-is.
@@ -657,11 +666,7 @@ class MLController(ABC):
                 validated_request = RequestModel.model_validate(body)
                 
                 # Extract data from request
-                if hasattr(validated_request, 'data'):
-                    data = getattr(validated_request, 'data')
-                else:
-                    # If custom request model, pass the whole request
-                    data = validated_request.model_dump()
+                data = self._request_to_input(validated_request)
                 
                 # Run prediction pipeline
                 result = await self.predict(data)
