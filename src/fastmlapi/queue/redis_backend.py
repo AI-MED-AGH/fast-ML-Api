@@ -16,6 +16,7 @@ import functools
 import json
 import uuid
 from typing import Any, Callable, List, Mapping, Optional, cast
+from urllib.parse import parse_qs, urlparse
 
 from .backend import QUEUED, Job, QueueBackend, QueueUnavailable
 
@@ -93,13 +94,14 @@ return 1
 
 
 def _guard(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Turn Redis connection errors into QueueUnavailable."""
+    """Turn any Redis error (connection loss, timeout, OOM, READONLY after a
+    failover, ...) into QueueUnavailable."""
 
     @functools.wraps(fn)
     def wrapper(self: "RedisBackend", *args: Any, **kwargs: Any) -> Any:
         try:
             return fn(self, *args, **kwargs)
-        except self._connection_errors as exc:
+        except self._redis_errors as exc:
             raise QueueUnavailable(f"Redis unavailable: {exc}") from exc
 
     return wrapper
@@ -134,6 +136,8 @@ class RedisBackend(QueueBackend):
         prefix: str = "fastmlapi:",
         result_ttl: float = 3600.0,
         clock: Optional[Callable[[], float]] = None,
+        socket_timeout: float = 5.0,
+        socket_connect_timeout: float = 5.0,
     ):
         try:
             import redis
@@ -142,13 +146,21 @@ class RedisBackend(QueueBackend):
                 "RedisBackend requires the 'redis' package. "
                 "Install it with: pip install fastmlapi[queue]"
             ) from exc
-        self._r = redis.Redis.from_url(url, decode_responses=True)
-        self._connection_errors = (
-            redis.exceptions.ConnectionError,
-            redis.exceptions.TimeoutError,
-        )
+        # Without timeouts (redis-py < 8 default) a partitioned Redis hangs
+        # /health, /jobs and workers. Options set in the URL take precedence.
+        in_url = parse_qs(urlparse(url).query)
+        timeouts = {
+            name: value
+            for name, value in (
+                ("socket_timeout", socket_timeout),
+                ("socket_connect_timeout", socket_connect_timeout),
+            )
+            if name not in in_url
+        }
+        self._r = redis.Redis.from_url(url, decode_responses=True, **timeouts)
+        self._redis_errors = redis.exceptions.RedisError
         self._prefix = prefix
-        self._result_ttl = int(result_ttl)
+        self._result_ttl = max(1, int(result_ttl))  # EXPIRE 0 would delete at once
         self._clock = clock
         self._claim = self._r.register_script(_CLAIM)
         self._heartbeat = self._r.register_script(_HEARTBEAT)
@@ -245,5 +257,5 @@ class RedisBackend(QueueBackend):
     def ping(self) -> bool:
         try:
             return bool(self._r.ping())
-        except self._connection_errors:
+        except self._redis_errors:
             return False

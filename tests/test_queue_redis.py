@@ -111,3 +111,54 @@ def test_job_completed_after_snapshot_is_not_resurrected():
         r = _fresh_client(url)
         for key in r.scan_iter(match=prefix + "*"):
             r.delete(key)
+
+
+def test_any_redis_error_becomes_queue_unavailable_and_ping_false(monkeypatch):
+    redis = pytest.importorskip("redis")
+    from fastmlapi.queue.redis_backend import RedisBackend
+
+    b = RedisBackend("redis://127.0.0.1:1/0")
+
+    def oom(*args, **kwargs):
+        raise redis.exceptions.ResponseError("OOM command not allowed")
+
+    monkeypatch.setattr(b._r, "hgetall", oom)
+    monkeypatch.setattr(b._r, "llen", oom)
+    monkeypatch.setattr(b._r, "ping", oom)
+    with pytest.raises(QueueUnavailable):
+        b.get_job("x")
+    with pytest.raises(QueueUnavailable):
+        b.pending_count()
+    assert b.ping() is False
+
+
+def test_client_gets_default_socket_timeouts():
+    pytest.importorskip("redis")
+    from fastmlapi.queue.redis_backend import RedisBackend
+
+    kw = RedisBackend("redis://127.0.0.1:1/0")._r.connection_pool.connection_kwargs
+    assert kw["socket_timeout"] == 5.0
+    assert kw["socket_connect_timeout"] == 5.0
+
+    kw = RedisBackend(
+        "redis://127.0.0.1:1/0", socket_timeout=1.5, socket_connect_timeout=2.5
+    )._r.connection_pool.connection_kwargs
+    assert kw["socket_timeout"] == 1.5
+    assert kw["socket_connect_timeout"] == 2.5
+
+
+def test_timeouts_in_the_url_win_over_the_defaults():
+    pytest.importorskip("redis")
+    from fastmlapi.queue.redis_backend import RedisBackend
+
+    b = RedisBackend("redis://127.0.0.1:1/0?socket_timeout=9")
+    kw = b._r.connection_pool.connection_kwargs
+    assert kw["socket_timeout"] == 9.0
+    assert kw["socket_connect_timeout"] == 5.0
+
+
+def test_result_ttl_below_one_second_is_clamped_to_one():
+    pytest.importorskip("redis")
+    from fastmlapi.queue.redis_backend import RedisBackend
+
+    assert RedisBackend("redis://127.0.0.1:1/0", result_ttl=0.5)._result_ttl == 1
