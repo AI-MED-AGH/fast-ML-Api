@@ -3,7 +3,7 @@
 import logging
 from typing import Any, Dict, Type, Union
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
@@ -49,10 +49,11 @@ def register_queue_routes(
         summary=f"Submit a {controller.model_name} job",
         responses=_RESPONSES,
     )
-    async def submit_job(body: request_model):  # type: ignore[valid-type]
-        # The whole validated body is stored; the worker re-validates it so
-        # preprocess() gets exactly what /predict would give it.
-        payload = body.model_dump(mode="json")  # type: ignore[attr-defined]
+    async def submit_job(request: Request, body: request_model):  # type: ignore[valid-type]
+        # `body` makes FastAPI validate (422) and document the schema. Store
+        # the raw JSON, not a dump of `body`: the worker validates it exactly
+        # as /predict does (aliases, validators and strict types all agree).
+        payload = await request.json()
         try:
             job_id = await run_in_threadpool(backend.enqueue, payload)
         except QueueUnavailable as exc:

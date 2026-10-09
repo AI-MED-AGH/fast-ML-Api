@@ -70,7 +70,7 @@ Keys prefixed `fastmlapi:{model_name}:`.
 
 - `pending`: list of job ids.
 - `processing:{worker_id}`: list of job ids claimed by that worker.
-- `job:{id}`: hash with `status`, `payload` (the whole validated request body, JSON; the worker validates it again with `request_model` and extracts the model input the same way `/predict` does), `result` or `error`/`error_type`, `attempts`, `created_at`, `started_at`, `finished_at`, `heartbeat`.
+- `job:{id}`: hash with `status`, `payload` (the raw JSON request body, stored once `POST /jobs` has validated it; the worker validates it again with `request_model` and extracts the model input the same way `/predict` does), `result` or `error`/`error_type`, `attempts`, `created_at`, `started_at`, `finished_at`, `heartbeat`.
 
 ### Lifecycle
 

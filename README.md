@@ -567,7 +567,7 @@ app = controller.app
 
 Pass the URL string, not a `RedisBackend` you built yourself: the URL form uses the key prefix `fastmlapi:{model_name}:`, the same as `run_worker(redis_url=...)`. A `RedisBackend(url)` defaults to the prefix `fastmlapi:`, which workers do not read.
 
-The whole validated request body is queued; the worker validates it again with `request_model`, so `preprocess()` receives the same input as with `/predict`.
+The raw JSON request body is queued (after `POST /jobs` has validated it); the worker validates it with `request_model` exactly as `/predict` does, so `preprocess()` receives the same input in both modes.
 
 ### Endpoints
 

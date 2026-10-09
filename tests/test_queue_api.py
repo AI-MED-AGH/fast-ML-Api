@@ -1,11 +1,12 @@
 """API and controller integration for queue mode."""
 
 from datetime import datetime
+from typing import List
 
 import uvicorn
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from fastmlapi import MLController, postprocessing, prediction, preprocessing
 from fastmlapi.queue.backend import QueueUnavailable
@@ -336,3 +337,64 @@ def test_jobs_routes_declare_404_and_503_in_openapi():
     paths = api.app.openapi()["paths"]
     assert "503" in paths["/jobs"]["post"]["responses"]
     assert {"404", "503"} <= set(paths["/jobs/{job_id}"]["get"]["responses"])
+
+
+class AliasRequest(BaseModel):
+    input_text: str = Field(alias="inputText")
+
+
+class AliasEcho(MLController):
+    model_name = "alias-echo"
+    request_model = AliasRequest
+    seen = []
+
+    @preprocessing
+    def preprocess(self, data):
+        type(self).seen.append(data)
+        return data["input_text"]
+
+    @prediction
+    def infer(self, text):
+        return text.upper()
+
+
+def test_alias_only_request_model_works_in_queue_mode():
+    AliasEcho.seen = []
+    job = _run_job(AliasEcho, {"inputText": "hi"})
+    assert job["status"] == "succeeded", job
+    assert job["result"] == {"result": "HI"}
+    assert _run_sync(AliasEcho, {"inputText": "hi"}) == {"result": "HI"}
+    assert AliasEcho.seen[0] == AliasEcho.seen[1]
+
+
+class ShoutRequest(BaseModel):
+    data: List[str]
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def bang(cls, value):
+        return [s + "!" for s in value]
+
+
+class Shouter(MLController):
+    model_name = "shouter"
+    request_model = ShoutRequest
+    seen = []
+
+    @preprocessing
+    def preprocess(self, data):
+        type(self).seen.append(data)
+        return data
+
+    @prediction
+    def infer(self, data):
+        return data
+
+
+def test_before_validator_runs_once_per_execution_path():
+    Shouter.seen = []
+    job = _run_job(Shouter, {"data": ["a"]})
+    assert job["status"] == "succeeded", job
+    assert _run_sync(Shouter, {"data": ["a"]}) == {"result": ["a!"]}
+    assert Shouter.seen == [["a!"], ["a!"]]
+    assert job["result"] == {"result": ["a!"]}
