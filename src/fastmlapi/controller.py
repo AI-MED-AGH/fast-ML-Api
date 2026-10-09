@@ -513,7 +513,8 @@ class MLController(ABC):
             try:
                 connected = backend.ping()
                 depth = backend.pending_count() if connected else None
-            except QueueUnavailable:
+            except QueueUnavailable as exc:
+                logger.warning("Job queue unavailable: %s", exc)
                 connected, depth = False, None
             return {
                 "status": "healthy" if connected else "not_ready",

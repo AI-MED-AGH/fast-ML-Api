@@ -295,3 +295,44 @@ def test_use_queue_accepts_a_redis_url_with_the_model_name_prefix(monkeypatch):
     assert seen["prefix"] == "fastmlapi:doubler:"
     assert isinstance(ctrl._queue_backend, MemoryBackend)
     assert any(getattr(r, "path", None) == "/jobs" for r in ctrl.app.routes)
+
+
+def test_503_bodies_do_not_leak_backend_details():
+    secret = "redis://secret-host:6379 refused"
+
+    class Down(MemoryBackend):
+        def enqueue(self, payload):
+            raise QueueUnavailable(secret)
+
+        def get_job(self, job_id):
+            raise QueueUnavailable(secret)
+
+        def ping(self):
+            raise QueueUnavailable(secret)
+
+        def pending_count(self):
+            raise QueueUnavailable(secret)
+
+    api = Doubler()
+    api.use_queue(Down())
+    with TestClient(api.app) as client:
+        responses = [
+            client.post("/jobs", json={"data": {"n": 1}}),
+            client.get("/jobs/x"),
+            client.get("/health"),
+        ]
+    for r in responses:
+        assert r.status_code == 503
+        assert "secret-host" not in r.text
+    assert responses[0].json()["detail"] == {
+        "error": "Job queue is unavailable",
+        "error_type": "QueueUnavailable",
+    }
+
+
+def test_jobs_routes_declare_404_and_503_in_openapi():
+    api = Doubler()
+    api.use_queue(MemoryBackend())
+    paths = api.app.openapi()["paths"]
+    assert "503" in paths["/jobs"]["post"]["responses"]
+    assert {"404", "503"} <= set(paths["/jobs/{job_id}"]["get"]["responses"])
