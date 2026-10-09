@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fastmlapi.queue` package: `QueueBackend`, `MemoryBackend`, `RedisBackend`, `Worker`
 - `result_ttl`, `visibility_timeout`, `max_attempts`, `heartbeat_interval` class attributes
 - `HealthResponse.queue_connected` / `queue_depth` (queue mode only)
+- `use_queue()` accepts a Redis URL (same key prefix as `run_worker(redis_url=...)`), for `uvicorn main:app` deployments
+- `RedisBackend(socket_timeout=5.0, socket_connect_timeout=5.0)`; options set in the URL take precedence
 
 ### Changed
 

@@ -70,7 +70,7 @@ Keys prefixed `fastmlapi:{model_name}:`.
 
 - `pending`: list of job ids.
 - `processing:{worker_id}`: list of job ids claimed by that worker.
-- `job:{id}`: hash with `status`, `payload` (JSON), `result` or `error`/`error_type`, `attempts`, `created_at`, `started_at`, `finished_at`, `heartbeat`.
+- `job:{id}`: hash with `status`, `payload` (the whole validated request body, JSON; the worker validates it again with `request_model` and extracts the model input the same way `/predict` does), `result` or `error`/`error_type`, `attempts`, `created_at`, `started_at`, `finished_at`, `heartbeat`.
 
 ### Lifecycle
 
@@ -83,7 +83,7 @@ Keys prefixed `fastmlapi:{model_name}:`.
 
 ### Crash recovery
 
-Workers (not the API) periodically run `requeue_stale`, between jobs, at the start of a claim attempt and at most every `sweep_interval` (default `max(visibility_timeout/2, 1)` s). Jobs of dead workers are therefore recovered as soon as any worker is free or running: any job in a `processing:*` list whose heartbeat is older than `visibility_timeout` returns to `pending`. After `max_attempts` it is marked `failed` with a "worker lost" error. Runtime length does not matter, only heartbeat freshness, so a 20-minute job on a live worker is safe.
+Workers (not the API) periodically run `requeue_stale`, between jobs, at the start of a claim attempt and at most every `sweep_interval` (default `max(visibility_timeout/2, 1)` s). Jobs of dead workers are therefore recovered as soon as any worker is between jobs, or starts: any job in a `processing:*` list whose heartbeat is older than `visibility_timeout` returns to `pending`. After `max_attempts` it is marked `failed` with a "worker lost" error. Runtime length does not matter, only heartbeat freshness, so a 20-minute job on a live worker is safe.
 
 Completion, failure and heartbeat are fenced by worker id: a worker that lost its job (because it was requeued and claimed elsewhere) cannot overwrite the new owner's state.
 

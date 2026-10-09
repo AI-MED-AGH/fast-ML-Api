@@ -544,6 +544,8 @@ pip install fastmlapi[queue]
 Write one `MLController` subclass and start it in either role:
 
 ```python
+import sys
+
 if __name__ == "__main__":
     controller = MyModel()
     if sys.argv[1:] == ["worker"]:
@@ -554,13 +556,26 @@ if __name__ == "__main__":
 
 See [`examples/queue_worker.py`](examples/queue_worker.py) for a complete example. Start as many workers as you need; they scale horizontally against the same Redis.
 
+To serve the API with `uvicorn main:app`, enable queue mode before taking `.app`, with the same Redis URL the workers use:
+
+```python
+# main.py
+controller = MyModel()
+controller.use_queue("redis://localhost:6379/0")
+app = controller.app
+```
+
+Pass the URL string, not a `RedisBackend` you built yourself: the URL form uses the key prefix `fastmlapi:{model_name}:`, the same as `run_worker(redis_url=...)`. A `RedisBackend(url)` defaults to the prefix `fastmlapi:`, which workers do not read.
+
+The whole validated request body is queued; the worker validates it again with `request_model`, so `preprocess()` receives the same input as with `/predict`.
+
 ### Endpoints
 
 | Endpoint | Behaviour |
 |----------|-----------|
-| `POST /jobs` | Validates the body against `request_model` (422 if invalid), enqueues it and returns `202 {"job_id": "..."}`. 503 if Redis is unreachable. |
+| `POST /jobs` | Validates the body against `request_model` (422 if invalid), enqueues it and returns `202 {"job_id": "..."}`. 503 if Redis is unreachable or returns an error. |
 | `GET /jobs/{id}` | Returns `status` (`queued`, `running`, `succeeded` or `failed`) plus `result` (succeeded) or `error` / `error_type` (failed), and `attempts`, `created_at`, `started_at`, `finished_at`. 404 if unknown or expired. |
-| `GET /health` | 200 when the queue backend is reachable, 503 otherwise; includes `queue_connected` and `queue_depth`. `model_loaded` is omitted. |
+| `GET /health` | 200 when the queue backend is reachable, 503 otherwise; includes `queue_connected` and `queue_depth`. `model_loaded` is omitted. It does not tell you whether any worker is alive. |
 
 `/predict` is not available in queue mode, and the API process does not load the model (`setup()` still runs). Workers run `setup()` and `load_model()` at startup and exit non-zero if they fail.
 
@@ -583,6 +598,11 @@ Override these class attributes on your controller:
 - **Results must be JSON-serializable.** Otherwise the job fails with a serialization error.
 - **Results expire.** Finished jobs are deleted after `result_ttl`.
 - **Crash recovery is done by workers, not the API.** Workers requeue jobs of dead workers when they sweep. The sweep runs between jobs (at the start of each claim attempt, at most every `sweep_interval`, default `max(visibility_timeout / 2, 1)` seconds). If every worker is busy with a long job, a dead worker's job is recovered once one of them becomes free; if all workers are dead, it is recovered when a worker starts.
+- **No authentication on `/jobs`.** Anyone who can reach the API can submit jobs and poll them. Job ids are random (uuid4) and hard to guess, but are not secrets; put the API behind your own auth if needed.
+- **Configure Redis to keep jobs.** Use persistence and `maxmemory-policy noeviction`. If Redis is flushed or evicts keys, queued jobs are lost and show as 404.
+- **Redis Cluster is not supported.** Use a single Redis instance (with replicas/Sentinel if you like).
+- **One queue per `model_name`.** Queue keys are named after `model_name`, so controllers that keep the default `"ml-model"` share a queue. Give each model a unique `model_name`.
+- **Redis timeouts.** `RedisBackend` uses 5 s socket and connect timeouts by default (`socket_timeout=` / `socket_connect_timeout=`, or set them in the URL query string).
 - **Worker ids must be unique per process.** Completion, failure and heartbeats are fenced by worker id, so a worker that lost its job cannot overwrite the new owner. The default id (`hostname-pid-random`) is unique per process; if you pass a custom `worker_id`, keep it unique.
 
 ## Configuration Reference
