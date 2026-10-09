@@ -107,6 +107,11 @@ def _guard(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _glob_escape(text: str) -> str:
+    """Escape Redis glob syntax so a prefix matches literally in SCAN MATCH."""
+    return "".join("\\" + ch if ch in "[]*?\\" else ch for ch in text)
+
+
 def _to_job(job_id: str, h: Mapping[Any, Any]) -> Job:
     def num(key: str) -> Optional[float]:
         value = h.get(key)
@@ -239,7 +244,7 @@ class RedisBackend(QueueBackend):
     def requeue_stale(self, visibility_timeout: float, max_attempts: int) -> int:
         now = self._now()
         touched = 0
-        for key in self._r.scan_iter(match=self._k("processing:*")):
+        for key in self._r.scan_iter(match=_glob_escape(self._prefix) + "processing:*"):
             # decode_responses=True, so the ids are str at runtime
             for job_id in cast(List[str], self._r.lrange(key, 0, -1)):
                 outcome = self._requeue(

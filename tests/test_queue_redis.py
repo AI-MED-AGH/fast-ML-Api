@@ -162,3 +162,27 @@ def test_result_ttl_below_one_second_is_clamped_to_one():
     from fastmlapi.queue.redis_backend import RedisBackend
 
     assert RedisBackend("redis://127.0.0.1:1/0", result_ttl=0.5)._result_ttl == 1
+
+
+def test_glob_characters_in_the_prefix_are_escaped():
+    from fastmlapi.queue.redis_backend import _glob_escape
+
+    assert _glob_escape("fastmlapi:m[1]*?\\x:") == "fastmlapi:m\\[1\\]\\*\\?\\\\x:"
+
+
+@needs_redis
+def test_requeue_stale_finds_jobs_when_the_prefix_has_glob_characters():
+    from fastmlapi.queue.redis_backend import RedisBackend, _glob_escape
+
+    prefix = f"fastmlapi-test:{uuid.uuid4().hex}:m[1]*?:"
+    now = [1000.0]
+    b = RedisBackend(os.environ["REDIS_URL"], prefix=prefix, clock=lambda: now[0])
+    try:
+        job_id = b.enqueue({})
+        b.claim("dead-worker")
+        now[0] += 100
+        assert b.requeue_stale(30, 3) == 1
+        assert b.get_job(job_id).status == "queued"
+    finally:
+        for key in b._r.scan_iter(match=_glob_escape(prefix) + "*"):
+            b._r.delete(key)
