@@ -271,3 +271,100 @@ def test_heartbeat_keeps_running_while_the_result_write_is_retried():
     worker.run_once()
     assert backend.get_job(job_id).status == "succeeded"
     assert backend.beats_while_saving > 0
+
+
+# -- worker liveness: how an orchestrator learns that a worker has loaded its model ---
+
+class SpyBackend(MemoryBackend):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.alive_calls = []
+
+    def worker_alive(self, worker_id, model_loaded, ttl):
+        self.alive_calls.append((model_loaded, ttl))
+        super().worker_alive(worker_id, model_loaded, ttl)
+
+
+def run_in_thread(worker):
+    t = threading.Thread(target=worker.run, daemon=True)
+    t.start()
+    return t
+
+
+def test_worker_reports_not_loaded_while_the_model_loads_and_loaded_afterwards():
+    backend = SpyBackend(clock=time.time)
+    seen = {}
+
+    class SlowStart(Doubler):
+        heartbeat_interval = 0.05
+
+        def setup(self):
+            seen["during"] = [(w.model_loaded) for w in backend.list_workers()]
+
+    worker = Worker(SlowStart(), backend, poll_interval=0.01)
+    t = run_in_thread(worker)
+    try:
+        assert wait_for(lambda: any(w.model_loaded for w in backend.list_workers()))
+        assert seen["during"] == [False]                  # visible as "starting" before the model was ready
+        assert backend.alive_calls[0][0] is False and backend.alive_calls[-1][0] is True
+    finally:
+        worker.stop()
+        t.join(5)
+
+
+def test_liveness_is_refreshed_with_a_ttl_of_three_heartbeats():
+    backend = SpyBackend(clock=time.time)
+
+    class Quick(Doubler):
+        heartbeat_interval = 0.05
+
+    worker = Worker(Quick(), backend, poll_interval=0.01)
+    t = run_in_thread(worker)
+    try:
+        assert wait_for(lambda: len(backend.alive_calls) >= 4)
+        assert all(ttl == pytest.approx(0.15) or ttl >= 1 for _, ttl in backend.alive_calls)
+        first = backend.list_workers()[0].last_seen
+        time.sleep(0.2)
+        assert backend.list_workers()[0].last_seen > first
+    finally:
+        worker.stop()
+        t.join(5)
+
+
+def test_graceful_stop_removes_the_liveness_entry():
+    backend = MemoryBackend(clock=time.time)
+    worker = Worker(Doubler(), backend, poll_interval=0.01)
+    t = run_in_thread(worker)
+    assert wait_for(lambda: backend.list_workers() != [])
+    worker.stop()
+    t.join(5)
+    assert backend.list_workers() == []
+
+
+def test_failed_startup_leaves_no_liveness_entry():
+    backend = MemoryBackend(clock=time.time)
+
+    class Broken(Doubler):
+        def load_model(self):
+            raise RuntimeError("no weights")
+
+    worker = Worker(Broken(), backend, poll_interval=0.01)
+    with pytest.raises(RuntimeError):
+        worker.run()
+    assert backend.list_workers() == []
+
+
+def test_an_outage_while_publishing_liveness_does_not_stop_the_worker():
+    class Flaky(MemoryBackend):
+        def worker_alive(self, worker_id, model_loaded, ttl):
+            raise QueueUnavailable("redis down")
+
+    backend = Flaky()
+    worker = Worker(Doubler(), backend, poll_interval=0.01)
+    job_id = backend.enqueue({"data": {"n": 3}})
+    t = run_in_thread(worker)
+    try:
+        assert wait_for(lambda: backend.get_job(job_id).status == "succeeded")
+    finally:
+        worker.stop()
+        t.join(5)

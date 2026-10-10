@@ -10,7 +10,7 @@ import uuid
 from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional
 
-from .backend import FAILED, QUEUED, RUNNING, SUCCEEDED, Job, QueueBackend
+from .backend import FAILED, QUEUED, RUNNING, SUCCEEDED, Job, QueueBackend, WorkerInfo
 
 
 class MemoryBackend(QueueBackend):
@@ -24,6 +24,7 @@ class MemoryBackend(QueueBackend):
         self._pending: Deque[str] = deque()  # claim pops from the right
         self._processing: Dict[str, List[str]] = {}
         self._expiry: Dict[str, float] = {}
+        self._workers: Dict[str, Dict[str, Any]] = {}
         self._result_ttl = result_ttl
         self._clock = clock
 
@@ -45,6 +46,7 @@ class MemoryBackend(QueueBackend):
     def _finish(self, worker_id: str, job: Job) -> None:
         now = self._clock()
         job.finished_at = now
+        job.payload = None  # the request body is only needed while the job can still run
         ids = self._processing.get(worker_id, [])
         if job.id in ids:
             ids.remove(job.id)
@@ -135,6 +137,7 @@ class MemoryBackend(QueueBackend):
                         job.error = f"Worker lost after {job.attempts} attempt(s)"
                         job.error_type = "WorkerLost"
                         job.finished_at = now
+                        job.payload = None
                         self._expiry[job_id] = now + self._result_ttl
                     else:
                         job.status = QUEUED
@@ -149,3 +152,31 @@ class MemoryBackend(QueueBackend):
 
     def ping(self) -> bool:
         return True
+
+    # -- worker liveness ---------------------------------------------------
+
+    def worker_alive(self, worker_id: str, model_loaded: bool, ttl: float) -> None:
+        with self._lock:
+            now = self._clock()
+            entry = self._workers.get(worker_id)
+            started = entry["started_at"] if entry and entry["expires_at"] > now else now
+            self._workers[worker_id] = {
+                "model_loaded": bool(model_loaded),
+                "started_at": started,
+                "last_seen": now,
+                "expires_at": now + max(1.0, float(ttl)),
+            }
+
+    def worker_gone(self, worker_id: str) -> None:
+        with self._lock:
+            self._workers.pop(worker_id, None)
+
+    def list_workers(self) -> List[WorkerInfo]:
+        with self._lock:
+            now = self._clock()
+            for worker_id in [w for w, e in self._workers.items() if e["expires_at"] <= now]:
+                del self._workers[worker_id]
+            return [
+                WorkerInfo(w, e["model_loaded"], e["started_at"], e["last_seen"])
+                for w, e in sorted(self._workers.items())
+            ]

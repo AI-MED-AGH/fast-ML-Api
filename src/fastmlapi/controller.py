@@ -13,7 +13,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from ._version import __version__
@@ -28,10 +28,21 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+
+def _invalid_request(errors: list) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"error": "Invalid request", "error_type": "ValidationError", "errors": errors},
+    )
+
+
 ENV_HOST = "FASTMLAPI_HOST"
 ENV_PORT = "FASTMLAPI_PORT"
 ENV_CACHE_DIR = "FASTMLAPI_CACHE_DIR"
 ENV_GPU_MEMORY_FRACTION = "FASTMLAPI_GPU_MEMORY_FRACTION"
+ENV_ROLE = "FASTMLAPI_ROLE"
+ENV_QUEUE_URL = "FASTMLAPI_QUEUE_URL"
+ROLES = ("sync", "api", "worker")
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
@@ -387,6 +398,22 @@ class MLController(ABC):
             backend = self._redis_backend(backend)
         self._queue_backend = backend
 
+    @staticmethod
+    def _role_from_env() -> str:
+        """FASTMLAPI_ROLE: sync (default), api (serve /jobs) or worker (run queued jobs). Lets one image play any role
+        without code changes."""
+        role = os.environ.get(ENV_ROLE) or "sync"
+        if role not in ROLES:
+            raise ValueError(f"Invalid {ENV_ROLE}={role!r}: expected one of {', '.join(ROLES)}")
+        return role
+
+    @staticmethod
+    def _queue_url_from_env(role: str) -> str:
+        url = os.environ.get(ENV_QUEUE_URL)
+        if not url:
+            raise ValueError(f"{ENV_ROLE}={role} needs {ENV_QUEUE_URL} (a Redis URL)")
+        return url
+
     def _redis_backend(self, url: str) -> QueueBackend:
         from .queue.redis_backend import RedisBackend
 
@@ -411,8 +438,9 @@ class MLController(ABC):
         """Run a queue worker in this process: load the model, then process
         jobs until SIGINT/SIGTERM. Exits non-zero if startup fails."""
         if backend is None:
-            if redis_url is None:
-                raise ValueError("run_worker() needs redis_url (or backend=)")
+            redis_url = redis_url or os.environ.get(ENV_QUEUE_URL)
+            if not redis_url:
+                raise ValueError(f"run_worker() needs redis_url, backend= or {ENV_QUEUE_URL}")
             backend = self._redis_backend(redis_url)
         from .queue.worker import Worker
 
@@ -510,9 +538,11 @@ class MLController(ABC):
         """Return health check information."""
         backend = self._queue_backend
         if backend is not None:
+            workers = None
             try:
                 connected = backend.ping()
                 depth = backend.pending_count() if connected else None
+                workers = backend.list_workers() if connected else None
             except QueueUnavailable as exc:
                 logger.warning("Job queue unavailable: %s", exc)
                 connected, depth = False, None
@@ -522,6 +552,8 @@ class MLController(ABC):
                 "version": self.model_version,
                 "queue_connected": connected,
                 "queue_depth": depth,
+                "queue_workers": None if workers is None else len(workers),
+                "queue_workers_ready": None if workers is None else sum(1 for w in workers if w.model_loaded),
             }
         ready = self._ready and self.is_loaded
         return {
@@ -665,12 +697,19 @@ class MLController(ABC):
         
         async def predict_endpoint(request: Request) -> Any:
             """Run prediction on the input data."""
+            # A malformed request is the client's mistake (422); only failures inside the model are 500s.
             try:
-                # Parse request body using the configured model
                 body = await request.json()
+            except ValueError:
+                raise _invalid_request([{"loc": ["body"], "msg": "Request body is not valid JSON", "type": "json_invalid"}])
+            try:
                 validated_request = RequestModel.model_validate(body)
-                
-                # Extract data from request
+            except ValidationError as exc:
+                # loc, msg and type only: never echo the submitted values back
+                raise _invalid_request(
+                    [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+                )
+            try:
                 data = self._request_to_input(validated_request)
                 
                 # Run prediction pipeline
@@ -724,6 +763,8 @@ class MLController(ABC):
     def app(self) -> FastAPI:
         """Get or create the FastAPI application instance."""
         if self._app is None:
+            if self._queue_backend is None and self._role_from_env() == "api":
+                self.use_queue(self._queue_url_from_env("api"))  # `uvicorn main:app` with FASTMLAPI_ROLE=api
             self._app = self._create_app()
         return self._app
     
@@ -747,8 +788,13 @@ class MLController(ABC):
         """
         import uvicorn
         
+        role = self._role_from_env()  # validated even when queue_url is given, so a typo is never silently ignored
         if queue_url is not None:
-            self.use_queue(queue_url)
+            self.use_queue(queue_url)  # an explicit argument wins over the environment
+        elif role == "worker":
+            return self.run_worker(redis_url=self._queue_url_from_env(role))
+        elif role == "api":
+            self.use_queue(self._queue_url_from_env(role))
         
         if host is None:
             host = os.environ.get(ENV_HOST) or DEFAULT_HOST

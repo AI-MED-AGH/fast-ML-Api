@@ -315,6 +315,8 @@ raise `ValueError` at startup. This only limits PyTorch's caching allocator; oth
 | `FASTMLAPI_PORT` | `8000` | Default bind port for `run()` |
 | `FASTMLAPI_CACHE_DIR` | `./.cache/fastmlapi` | Persistent cache directory (`self.cache_dir`) |
 | `FASTMLAPI_GPU_MEMORY_FRACTION` | unset | Overrides `gpu_memory_fraction` |
+| `FASTMLAPI_ROLE` | `sync` | What `run()` does: `sync` serves `/predict`, `api` serves `/jobs` (queue mode), `worker` runs queued jobs. See [Long-running jobs](#long-running-jobs-queue-mode) |
+| `FASTMLAPI_QUEUE_URL` | unset | Redis URL for the `api` and `worker` roles (also the default for `run_worker()`) |
 
 Arguments passed explicitly to `run(host=..., port=...)` take priority over the environment.
 
@@ -441,6 +443,14 @@ class MyController(MLController):
 
 ### Custom Request/Response Models
 
+**`request_model` describes the whole request body, not just a `data` field.** Without it, clients send the default
+`{"data": ..., "metadata": ...}` shape and nothing about `data` is checked. With it, clients send exactly the fields of your
+model, e.g. `{"image_url": "...", "threshold": 0.5}`, and `GET /schema` shows that same shape. What `preprocess()` receives:
+the model's `data` field if it has one, otherwise the validated request as a dict. A body that does not fit the model is
+rejected with **422** (`detail.errors` lists `loc`/`msg`/`type` per problem and never echoes the submitted values); exceptions
+raised by your own code are 500s. If you put a service such as a gateway in front of the model, it should forward the body
+unchanged.
+
 Define your own Pydantic models for type-safe requests and responses:
 
 ```python
@@ -554,6 +564,11 @@ if __name__ == "__main__":
         controller.run(queue_url="redis://localhost:6379/0")
 ```
 
+The role can also come from the environment, so one image can play every part without changing code. With
+`FASTMLAPI_ROLE=api` and `FASTMLAPI_QUEUE_URL=redis://...`, a plain `MyModel().run()` (or `uvicorn main:app`) serves `/jobs`;
+with `FASTMLAPI_ROLE=worker` the same `run()` starts a worker instead of a web server. An explicit `queue_url=` argument wins
+over the environment, an unknown role or a missing URL raises an error, and `sync` (the default) ignores `FASTMLAPI_QUEUE_URL`.
+
 See [`examples/queue_worker.py`](examples/queue_worker.py) for a complete example. Start as many workers as you need; they scale horizontally against the same Redis.
 
 To serve the API with `uvicorn main:app`, enable queue mode before taking `.app`, with the same Redis URL the workers use:
@@ -575,9 +590,38 @@ The raw JSON request body is queued (after `POST /jobs` has validated it); the w
 |----------|-----------|
 | `POST /jobs` | Validates the body against `request_model` (422 if invalid), enqueues it and returns `202 {"job_id": "..."}`. 503 if Redis is unreachable or returns an error. |
 | `GET /jobs/{id}` | Returns `status` (`queued`, `running`, `succeeded` or `failed`) plus `result` (succeeded) or `error` / `error_type` (failed), and `attempts`, `created_at`, `started_at`, `finished_at`. 404 if unknown or expired. |
-| `GET /health` | 200 when the queue backend is reachable, 503 otherwise; includes `queue_connected` and `queue_depth`. `model_loaded` is omitted. It does not tell you whether any worker is alive. |
+| `GET /health` | 200 when the queue backend is reachable, 503 otherwise; includes `queue_connected`, `queue_depth`, `queue_workers` (live workers) and `queue_workers_ready` (those that have loaded the model). `model_loaded` is omitted. |
 
 `/predict` is not available in queue mode, and the API process does not load the model (`setup()` still runs). Workers run `setup()` and `load_model()` at startup and exit non-zero if they fail.
+
+### Worker liveness
+
+Each worker publishes a small record (`workers:{id}`: `model_loaded`, `started_at`, `last_seen`) as soon as it starts, with
+`model_loaded=false` while `setup()`/`load_model()` run and `true` afterwards. It is refreshed every `heartbeat_interval`
+with a TTL of three heartbeats, so a crashed worker disappears by itself, and it is removed on a graceful stop. An orchestrator
+can read it to tell "starting" from "ready" for a worker, which has no HTTP port to probe. `backend.list_workers()` returns the
+same information.
+
+### What a finished job keeps
+
+The request body (`payload`) is stored only while a job can still run. As soon as a job succeeds, fails, or is given up as
+`WorkerLost`, the payload is deleted from Redis; only the result (or error) stays, until `result_ttl`. A job that is requeued
+after a crash keeps its payload so the retry has its input.
+
+### Redis requirements and permissions
+
+Redis **6.2 or newer** (the backend uses `LMOVE`). It uses **no Lua scripts and no `SCAN`/`KEYS`**: moving a job off `pending`
+is one atomic command, every other state change is an optimistic transaction (`WATCH`/`MULTI`/`EXEC`), and workers are found
+through a set instead of by scanning. That means the Redis user a model runs as only needs these commands, on keys under
+`fastmlapi:{model_name}:*`:
+
+```
+LMOVE LPUSH RPUSH LREM LRANGE LLEN LPOS  HSET HSETNX HGET HMGET HGETALL HDEL HINCRBY
+EXPIRE SADD SREM SMEMBERS DEL EXISTS  WATCH UNWATCH MULTI EXEC DISCARD  TIME PING
+```
+
+(`fastmlapi.queue.redis_backend.REDIS_COMMANDS_USED` is the authoritative list, plus the connection handshake `AUTH`/`HELLO`/
+`CLIENT SETINFO` that redis-py sends itself.) `tests/test_queue_acl.py` runs the whole job lifecycle as such a restricted user.
 
 ### Tuning
 
@@ -597,6 +641,7 @@ Override these class attributes on your controller:
 - **Heartbeats and the GIL.** A long CPU-bound call that never releases the GIL can delay heartbeats; if jobs get requeued while still running, raise `visibility_timeout`.
 - **Results must be JSON-serializable.** Otherwise the job fails with a serialization error.
 - **Results expire.** Finished jobs are deleted after `result_ttl`.
+- **A claim can be interrupted.** A worker that dies between taking a job off `pending` and marking it running leaves the job in its processing list unmarked; a sweeping worker requeues it once it has stayed that way for a whole `visibility_timeout`.
 - **Crash recovery is done by workers, not the API.** Workers requeue jobs of dead workers when they sweep. The sweep runs between jobs (at the start of each claim attempt, at most every `sweep_interval`, default `max(visibility_timeout / 2, 1)` seconds). If every worker is busy with a long job, a dead worker's job is recovered once one of them becomes free; if all workers are dead, it is recovered when a worker starts.
 - **No authentication on `/jobs`.** Anyone who can reach the API can submit jobs and poll them. Job ids are random (uuid4) and hard to guess, but are not secrets; put the API behind your own auth if needed.
 - **Configure Redis to keep jobs.** Use persistence and `maxmemory-policy noeviction`. If Redis is flushed or evicts keys, queued jobs are lost and show as 404.

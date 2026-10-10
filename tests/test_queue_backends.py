@@ -6,6 +6,7 @@ The memory backend always runs. The Redis backend runs when REDIS_URL is set
 
 import os
 import threading
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -40,7 +41,8 @@ def env(request):
     clock = FakeClock()
     if request.param == "memory":
         yield SimpleNamespace(
-            backend=MemoryBackend(result_ttl=100, clock=clock), clock=clock
+            backend=MemoryBackend(result_ttl=100, clock=clock), clock=clock,
+            pass_time=clock.advance,
         )
         return
     from fastmlapi.queue.redis_backend import RedisBackend
@@ -49,7 +51,11 @@ def env(request):
     backend = RedisBackend(
         os.environ["REDIS_URL"], prefix=prefix, result_ttl=100, clock=clock
     )
-    yield SimpleNamespace(backend=backend, clock=clock)
+    def pass_time(seconds):
+        clock.advance(seconds)
+        time.sleep(seconds)  # Redis expires keys on its own clock
+
+    yield SimpleNamespace(backend=backend, clock=clock, pass_time=pass_time)
     for key in backend._r.scan_iter(match=prefix + "*"):
         backend._r.delete(key)
 
@@ -239,3 +245,72 @@ def test_concurrent_claims_never_hand_out_the_same_job(env):
 
 def test_ping(env):
     assert env.backend.ping() is True
+
+
+# -- the request body is dropped once a job is finished ---------------------
+
+def test_payload_is_dropped_when_a_job_succeeds_or_fails(env):
+    b = env.backend
+    ok, bad = b.enqueue({"patient": "secret-1"}), b.enqueue({"patient": "secret-2"})
+    b.claim("w1")
+    b.claim("w1")
+    assert b.get_job(ok).payload == {"patient": "secret-1"}          # still needed while running
+    assert b.complete("w1", ok, {"score": 1}) is True
+    assert b.fail("w1", bad, "boom", "ValueError") is True
+    for job_id in (ok, bad):
+        assert b.get_job(job_id).payload is None
+    assert b.get_job(ok).result == {"score": 1}
+    assert b.get_job(bad).error == "boom"
+
+
+def test_payload_survives_a_requeue_so_the_retry_has_its_input(env):
+    b = env.backend
+    job_id = b.enqueue({"x": 1})
+    b.claim("w1")
+    env.clock.advance(31)
+    assert b.requeue_stale(30, 3) == 1
+    assert b.get_job(job_id).payload == {"x": 1}
+    assert b.claim("w2").payload == {"x": 1}
+
+
+def test_payload_is_dropped_when_a_job_is_failed_as_worker_lost(env):
+    b = env.backend
+    job_id = b.enqueue({"x": 1})
+    b.claim("w1")
+    env.clock.advance(31)
+    assert b.requeue_stale(30, 1) == 1
+    job = b.get_job(job_id)
+    assert job.status == "failed" and job.error_type == "WorkerLost" and job.payload is None
+
+
+# -- worker liveness (how an orchestrator knows a worker has loaded its model) -
+
+def test_worker_liveness_is_published_updated_and_expires(env):
+    b = env.backend
+    assert b.list_workers() == []
+    b.worker_alive("w1", model_loaded=False, ttl=1)
+    [w] = b.list_workers()
+    assert (w.worker_id, w.model_loaded) == ("w1", False)
+    b.worker_alive("w1", model_loaded=True, ttl=1)
+    [w] = b.list_workers()
+    assert w.model_loaded is True and w.last_seen is not None and w.started_at is not None
+    env.pass_time(1.5)
+    assert b.list_workers() == []                         # a dead worker disappears by itself
+
+
+def test_worker_gone_removes_the_liveness_entry_at_once(env):
+    b = env.backend
+    b.worker_alive("w1", model_loaded=True, ttl=60)
+    b.worker_alive("w2", model_loaded=True, ttl=60)
+    b.worker_gone("w1")
+    assert [w.worker_id for w in b.list_workers()] == ["w2"]
+    b.worker_gone("never-existed")                        # harmless
+
+
+def test_started_at_is_kept_across_refreshes(env):
+    b = env.backend
+    b.worker_alive("w1", model_loaded=False, ttl=60)
+    first = b.list_workers()[0].started_at
+    env.clock.advance(5)
+    b.worker_alive("w1", model_loaded=True, ttl=60)
+    assert b.list_workers()[0].started_at == first

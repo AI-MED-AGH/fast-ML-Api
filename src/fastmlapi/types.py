@@ -55,6 +55,8 @@ class HealthResponse(BaseModel):
     version: Optional[str] = Field(default=None)
     queue_connected: Optional[bool] = Field(default=None)
     queue_depth: Optional[int] = Field(default=None)
+    queue_workers: Optional[int] = Field(default=None, description="Live workers (queue mode)")
+    queue_workers_ready: Optional[int] = Field(default=None, description="Live workers that have loaded the model")
 
 
 class JobSubmitResponse(BaseModel):

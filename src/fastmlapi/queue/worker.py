@@ -51,6 +51,7 @@ class Worker:
         self._stop = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_sweep = float("-inf")
+        self._model_loaded = False
 
     # -- public ------------------------------------------------------------
 
@@ -64,15 +65,27 @@ class Worker:
         Exceptions from `setup()`/`load_model()` propagate so the process
         exits non-zero and the orchestrator restarts it.
         """
-        self.controller._initialize()
-        restore = self._install_signal_handlers()
-        logger.info("Worker %s started for %s", self.worker_id, self.controller.model_name)
+        # Tell the orchestrator this worker exists from the first moment, as "model not loaded yet": loading weights can
+        # take minutes. The entry expires by itself if the process dies.
+        self._publish_liveness()
+        stop_liveness = threading.Event()
+        liveness = threading.Thread(target=self._liveness_loop, args=(stop_liveness,), daemon=True)
+        liveness.start()
+        restore: Callable[[], None] = lambda: None
         try:
+            self.controller._initialize()
+            self._model_loaded = True
+            self._publish_liveness()
+            restore = self._install_signal_handlers()
+            logger.info("Worker %s started for %s", self.worker_id, self.controller.model_name)
             while not self._stop.is_set():
                 if not self._tick():
                     self._stop.wait(self.poll_interval)
         finally:
             restore()
+            stop_liveness.set()
+            liveness.join(timeout=5)
+            self._withdraw_liveness()
             if self._loop is not None:
                 self._loop.close()
                 self._loop = None
@@ -89,6 +102,27 @@ class Worker:
             return False
         self._process(job)
         return True
+
+    # -- liveness ----------------------------------------------------------
+
+    def _publish_liveness(self) -> None:
+        ttl = max(1.0, 3 * self.controller.heartbeat_interval)  # survives two missed beats
+        try:
+            self.backend.worker_alive(self.worker_id, self._model_loaded, ttl)
+        except QueueUnavailable:
+            logger.debug("Could not publish worker liveness: queue unavailable")
+        except Exception:
+            logger.warning("Could not publish worker liveness", exc_info=True)
+
+    def _liveness_loop(self, stop: threading.Event) -> None:
+        while not stop.wait(self.controller.heartbeat_interval):
+            self._publish_liveness()
+
+    def _withdraw_liveness(self) -> None:
+        try:
+            self.backend.worker_gone(self.worker_id)
+        except Exception:
+            logger.debug("Could not withdraw worker liveness", exc_info=True)
 
     # -- internals ---------------------------------------------------------
 

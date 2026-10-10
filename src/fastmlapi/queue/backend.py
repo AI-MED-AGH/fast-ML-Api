@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import abc
 import dataclasses
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -30,6 +30,16 @@ class Job:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     heartbeat: Optional[float] = None
+
+
+@dataclasses.dataclass
+class WorkerInfo:
+    """A live worker, as published by `worker_alive`."""
+
+    worker_id: str
+    model_loaded: bool
+    started_at: Optional[float] = None
+    last_seen: Optional[float] = None
 
 
 class QueueBackend(abc.ABC):
@@ -80,3 +90,17 @@ class QueueBackend(abc.ABC):
     @abc.abstractmethod
     def ping(self) -> bool:
         """True if the backend is reachable."""
+
+    # -- worker liveness (optional: default to doing nothing) ------------------
+
+    def worker_alive(self, worker_id: str, model_loaded: bool, ttl: float) -> None:
+        """Publish that this worker is running, and whether its model is loaded.
+        The entry disappears by itself after `ttl` seconds unless refreshed, so
+        a crashed worker stops being listed."""
+
+    def worker_gone(self, worker_id: str) -> None:
+        """Remove this worker's liveness entry (graceful shutdown)."""
+
+    def list_workers(self) -> List[WorkerInfo]:
+        """Workers whose liveness entry has not expired."""
+        return []

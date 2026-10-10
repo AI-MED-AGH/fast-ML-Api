@@ -1,13 +1,18 @@
 """Redis queue backend.
 
 Keys (all under `prefix`):
-  pending                list of job ids, enqueue LPUSH / claim RPOP (FIFO)
+  pending                list of job ids: enqueue LPUSH, claim takes from the right
   processing:{worker}    list of job ids claimed by that worker
   job:{id}               hash with the job record
+  worker_index           set of worker ids (so no key scanning is ever needed)
+  workers:{id}           hash published by a live worker, with a TTL: model_loaded, started_at, last_seen
 
-Every state transition that must be atomic is a Lua script, so two workers can
-never claim the same job and a stalled worker cannot overwrite a job that was
-requeued to someone else (completion is fenced by worker id).
+No Lua scripts and no SCAN/KEYS. Moving a job off `pending` is one atomic command (LMOVE); every other state change is an
+optimistic transaction (WATCH the job, then MULTI/EXEC), so two sweepers, or a stalled worker and the sweeper, can never both
+win. That keeps the backend inside the small set of commands in REDIS_COMMANDS_USED, which is what lets an operator give a
+model a Redis user that may only touch its own keys and cannot run scripts or list other tenants' key names.
+
+Requires Redis 6.2+ (LMOVE).
 """
 
 from __future__ import annotations
@@ -15,82 +20,21 @@ from __future__ import annotations
 import functools
 import json
 import uuid
-from typing import Any, Callable, List, Mapping, Optional, cast
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from .backend import QUEUED, Job, QueueBackend, QueueUnavailable
+from .backend import FAILED, QUEUED, RUNNING, SUCCEEDED, Job, QueueBackend, QueueUnavailable, WorkerInfo
 
-# KEYS: pending, processing:{worker}   ARGV: now, job key prefix, worker id
-_CLAIM = """
-local id = redis.call('RPOP', KEYS[1])
-if not id then return nil end
-redis.call('LPUSH', KEYS[2], id)
-local k = ARGV[2] .. id
-redis.call('HSET', k, 'status', 'running', 'started_at', ARGV[1],
-           'heartbeat', ARGV[1], 'worker', ARGV[3])
-redis.call('HINCRBY', k, 'attempts', 1)
-return id
-"""
+# Every Redis command this backend issues. Give a restricted Redis user exactly these (plus connection setup such as
+# AUTH/HELLO/CLIENT SETINFO, which redis-py sends itself).
+REDIS_COMMANDS_USED = (
+    "LMOVE", "LPUSH", "RPUSH", "LREM", "LRANGE", "LLEN", "LPOS",
+    "HSET", "HSETNX", "HGET", "HMGET", "HGETALL", "HDEL", "HINCRBY",
+    "EXPIRE", "SADD", "SREM", "SMEMBERS", "DEL", "EXISTS",
+    "WATCH", "UNWATCH", "MULTI", "EXEC", "DISCARD", "TIME", "PING",
+)
 
-# KEYS: job   ARGV: worker id, now
-_HEARTBEAT = """
-if redis.call('HGET', KEYS[1], 'status') ~= 'running'
-   or redis.call('HGET', KEYS[1], 'worker') ~= ARGV[1] then return 0 end
-redis.call('HSET', KEYS[1], 'heartbeat', ARGV[2])
-return 1
-"""
-
-# KEYS: job, processing:{worker}   ARGV: worker id, job id, now, ttl, result json
-_COMPLETE = """
-if redis.call('HGET', KEYS[1], 'status') ~= 'running'
-   or redis.call('HGET', KEYS[1], 'worker') ~= ARGV[1] then return 0 end
-redis.call('LREM', KEYS[2], 0, ARGV[2])
-redis.call('HSET', KEYS[1], 'status', 'succeeded', 'result', ARGV[5],
-           'finished_at', ARGV[3])
-redis.call('HDEL', KEYS[1], 'error', 'error_type')
-redis.call('EXPIRE', KEYS[1], ARGV[4])
-return 1
-"""
-
-# KEYS: job, processing:{worker}   ARGV: worker id, job id, now, ttl, error, error type
-_FAIL = """
-if redis.call('HGET', KEYS[1], 'status') ~= 'running'
-   or redis.call('HGET', KEYS[1], 'worker') ~= ARGV[1] then return 0 end
-redis.call('LREM', KEYS[2], 0, ARGV[2])
-redis.call('HSET', KEYS[1], 'status', 'failed', 'error', ARGV[5],
-           'error_type', ARGV[6], 'finished_at', ARGV[3])
-redis.call('HDEL', KEYS[1], 'result')
-redis.call('EXPIRE', KEYS[1], ARGV[4])
-return 1
-"""
-
-# KEYS: job, processing:{worker}, pending
-# ARGV: now, visibility timeout, max attempts, job id, ttl
-# returns 0 untouched, 1 requeued, 2 failed (worker lost)
-# The id list is read outside this script, so every decision is re-checked
-# here: the job must still be running and stale, and must still be listed
-# under this worker. Only the sweeper that removes the id acts on it.
-_REQUEUE_IF_STALE = """
-if redis.call('HGET', KEYS[1], 'status') ~= 'running' then
-  redis.call('LREM', KEYS[2], 0, ARGV[4])
-  return 0
-end
-local hb = tonumber(redis.call('HGET', KEYS[1], 'heartbeat') or '0')
-if tonumber(ARGV[1]) - hb <= tonumber(ARGV[2]) then return 0 end
-if redis.call('LREM', KEYS[2], 0, ARGV[4]) == 0 then return 0 end
-local attempts = tonumber(redis.call('HGET', KEYS[1], 'attempts') or '0')
-if attempts >= tonumber(ARGV[3]) then
-  redis.call('HSET', KEYS[1], 'status', 'failed',
-             'error', 'Worker lost after ' .. attempts .. ' attempt(s)',
-             'error_type', 'WorkerLost', 'finished_at', ARGV[1])
-  redis.call('EXPIRE', KEYS[1], ARGV[5])
-  return 2
-end
-redis.call('HSET', KEYS[1], 'status', 'queued')
-redis.call('HDEL', KEYS[1], 'worker')
-redis.call('RPUSH', KEYS[3], ARGV[4])
-return 1
-"""
+_TX_RETRIES = 25
 
 
 def _guard(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -105,11 +49,6 @@ def _guard(fn: Callable[..., Any]) -> Callable[..., Any]:
             raise QueueUnavailable(f"Redis unavailable: {exc}") from exc
 
     return wrapper
-
-
-def _glob_escape(text: str) -> str:
-    """Escape Redis glob syntax so a prefix matches literally in SCAN MATCH."""
-    return "".join("\\" + ch if ch in "[]*?\\" else ch for ch in text)
 
 
 def _to_job(job_id: str, h: Mapping[Any, Any]) -> Job:
@@ -162,14 +101,12 @@ class RedisBackend(QueueBackend):
         timeouts = {name: value for name, value in options if name not in in_url}
         self._r = redis.Redis.from_url(url, decode_responses=True, **timeouts)
         self._redis_errors = redis.exceptions.RedisError
+        self._watch_error = redis.exceptions.WatchError
         self._prefix = prefix
         self._result_ttl = max(1, int(result_ttl))  # EXPIRE 0 would delete at once
         self._clock = clock
-        self._claim = self._r.register_script(_CLAIM)
-        self._heartbeat = self._r.register_script(_HEARTBEAT)
-        self._complete = self._r.register_script(_COMPLETE)
-        self._fail = self._r.register_script(_FAIL)
-        self._requeue = self._r.register_script(_REQUEUE_IF_STALE)
+        # (processing list, job id) -> when this process first saw a job there that was never marked running
+        self._unmarked: Dict[Tuple[str, str], float] = {}
 
     def _k(self, name: str) -> str:
         return self._prefix + name
@@ -179,6 +116,30 @@ class RedisBackend(QueueBackend):
             return self._clock()
         seconds, micros = self._r.time()
         return float(seconds) + float(micros) / 1_000_000
+
+    def _transaction(self, watch_keys: List[str], body: Callable[[Any], Tuple[Any, Optional[Callable[[Any], None]]]]) -> Any:
+        """Optimistic transaction.
+
+        `body(pipe)` runs while `watch_keys` are watched (reads on `pipe` execute immediately) and returns
+        `(result, writes)`. `writes(pipe)` queues the commands to run atomically, or is None to change nothing. If any
+        watched key changed in between, the whole thing is retried against fresh data."""
+        for _ in range(_TX_RETRIES):
+            with self._r.pipeline() as pipe:
+                try:
+                    pipe.watch(*watch_keys)
+                    result, writes = body(pipe)
+                    if writes is None:
+                        pipe.unwatch()
+                        return result
+                    pipe.multi()
+                    writes(pipe)
+                    pipe.execute()
+                    return result
+                except self._watch_error:
+                    continue
+        raise QueueUnavailable("could not update the job: it kept changing underneath us")
+
+    # -- QueueBackend ------------------------------------------------------
 
     @_guard
     def enqueue(self, payload: Any) -> str:
@@ -200,38 +161,79 @@ class RedisBackend(QueueBackend):
 
     @_guard
     def claim(self, worker_id: str) -> Optional[Job]:
-        job_id = self._claim(
-            keys=[self._k("pending"), self._k(f"processing:{worker_id}")],
-            args=[self._now(), self._k("job:"), worker_id],
+        # one atomic command moves the job off `pending`, so two workers can never take the same one
+        job_id = self._r.lmove(
+            self._k("pending"), self._k(f"processing:{worker_id}"), "RIGHT", "LEFT"
         )
-        return self.get_job(job_id) if job_id else None
+        if not job_id:
+            return None
+        now = self._now()
+        pipe = self._r.pipeline(transaction=True)
+        pipe.sadd(self._k("worker_index"), worker_id)
+        pipe.hset(
+            self._k(f"job:{job_id}"),
+            mapping={"status": RUNNING, "started_at": now, "heartbeat": now, "worker": worker_id},
+        )
+        pipe.hincrby(self._k(f"job:{job_id}"), "attempts", 1)
+        pipe.execute()
+        return self.get_job(job_id)
 
     @_guard
     def heartbeat(self, worker_id: str, job_id: str) -> bool:
-        return bool(
-            self._heartbeat(
-                keys=[self._k(f"job:{job_id}")], args=[worker_id, self._now()]
-            )
-        )
+        job = self._k(f"job:{job_id}")
+        now = self._now()
+
+        def body(pipe: Any):
+            status, owner = pipe.hmget(job, "status", "worker")
+            if status != RUNNING or owner != worker_id:
+                return False, None
+            return True, lambda p: p.hset(job, "heartbeat", now)
+
+        return bool(self._transaction([job], body))
 
     @_guard
     def complete(self, worker_id: str, job_id: str, result: Any) -> bool:
         encoded = json.dumps(result)  # raises before touching Redis
-        return bool(
-            self._complete(
-                keys=[self._k(f"job:{job_id}"), self._k(f"processing:{worker_id}")],
-                args=[worker_id, job_id, self._now(), self._result_ttl, encoded],
-            )
-        )
+        job, processing = self._k(f"job:{job_id}"), self._k(f"processing:{worker_id}")
+        now = self._now()
+
+        def body(pipe: Any):
+            status, owner = pipe.hmget(job, "status", "worker")
+            if status != RUNNING or owner != worker_id:
+                return False, None
+
+            def writes(p: Any) -> None:
+                p.lrem(processing, 0, job_id)
+                p.hset(job, mapping={"status": SUCCEEDED, "result": encoded, "finished_at": now})
+                p.hdel(job, "error", "error_type", "payload")  # the request body is no longer needed
+                p.expire(job, self._result_ttl)
+
+            return True, writes
+
+        return bool(self._transaction([job], body))
 
     @_guard
     def fail(self, worker_id: str, job_id: str, error: str, error_type: str) -> bool:
-        return bool(
-            self._fail(
-                keys=[self._k(f"job:{job_id}"), self._k(f"processing:{worker_id}")],
-                args=[worker_id, job_id, self._now(), self._result_ttl, error, error_type],
-            )
-        )
+        job, processing = self._k(f"job:{job_id}"), self._k(f"processing:{worker_id}")
+        now = self._now()
+
+        def body(pipe: Any):
+            status, owner = pipe.hmget(job, "status", "worker")
+            if status != RUNNING or owner != worker_id:
+                return False, None
+
+            def writes(p: Any) -> None:
+                p.lrem(processing, 0, job_id)
+                p.hset(
+                    job,
+                    mapping={"status": FAILED, "error": error, "error_type": error_type, "finished_at": now},
+                )
+                p.hdel(job, "result", "payload")
+                p.expire(job, self._result_ttl)
+
+            return True, writes
+
+        return bool(self._transaction([job], body))
 
     @_guard
     def get_job(self, job_id: str) -> Optional[Job]:
@@ -242,16 +244,83 @@ class RedisBackend(QueueBackend):
     def requeue_stale(self, visibility_timeout: float, max_attempts: int) -> int:
         now = self._now()
         touched = 0
-        for key in self._r.scan_iter(match=_glob_escape(self._prefix) + "processing:*"):
-            # decode_responses=True, so the ids are str at runtime
-            for job_id in cast(List[str], self._r.lrange(key, 0, -1)):
-                outcome = self._requeue(
-                    keys=[self._k(f"job:{job_id}"), key, self._k("pending")],
-                    args=[now, visibility_timeout, max_attempts, job_id, self._result_ttl],
-                )
-                if outcome in (1, 2):
+        for worker in sorted(self._r.smembers(self._k("worker_index"))):
+            processing = self._k(f"processing:{worker}")
+            job_ids = self._r.lrange(processing, 0, -1)
+            for job_id in job_ids:
+                if self._sweep_one(worker, processing, job_id, now, visibility_timeout, max_attempts):
                     touched += 1
+            if not job_ids:
+                self._forget_worker_if_idle(worker, processing)
         return touched
+
+    def _sweep_one(
+        self, worker: str, processing: str, job_id: str, now: float, visibility_timeout: float, max_attempts: int
+    ) -> bool:
+        job, pending = self._k(f"job:{job_id}"), self._k("pending")
+        marker = (processing, job_id)
+
+        def requeue(p: Any) -> None:
+            p.lrem(processing, 0, job_id)
+            p.hset(job, "status", QUEUED)
+            p.hdel(job, "worker")
+            p.rpush(pending, job_id)
+
+        def body(pipe: Any):
+            # every decision is made on fresh data, and only while this job and list are unchanged (WATCH)
+            if pipe.lpos(processing, job_id) is None:
+                self._unmarked.pop(marker, None)
+                return 0, None  # someone else already dealt with it
+            status, owner, heartbeat, attempts = pipe.hmget(job, "status", "worker", "heartbeat", "attempts")
+            if status is None:  # the job record expired
+                self._unmarked.pop(marker, None)
+                return 0, lambda p: p.lrem(processing, 0, job_id)
+            if status == RUNNING and owner == worker:
+                self._unmarked.pop(marker, None)
+                if now - float(heartbeat or 0.0) <= visibility_timeout:
+                    return 0, None
+                made = int(attempts or 0)
+                if made >= max_attempts:
+                    def fail_job(p: Any) -> None:
+                        p.lrem(processing, 0, job_id)
+                        p.hset(
+                            job,
+                            mapping={
+                                "status": FAILED,
+                                "error": f"Worker lost after {made} attempt(s)",
+                                "error_type": "WorkerLost",
+                                "finished_at": now,
+                            },
+                        )
+                        p.hdel(job, "payload")
+                        p.expire(job, self._result_ttl)
+
+                    return 2, fail_job
+                return 1, requeue
+            if status == QUEUED and owner is None:
+                # taken off `pending` but never marked running: its worker may have died in between, or may be about to
+                # mark it. Only act once it has stayed that way for a whole visibility timeout.
+                first = self._unmarked.setdefault(marker, now)
+                if now - first <= visibility_timeout:
+                    return 0, None
+                self._unmarked.pop(marker, None)
+                return 1, requeue
+            # finished, or now owned by another worker: this id is only a leftover in this list
+            self._unmarked.pop(marker, None)
+            return 0, lambda p: p.lrem(processing, 0, job_id)
+
+        return self._transaction([job, processing], body) in (1, 2)
+
+    def _forget_worker_if_idle(self, worker: str, processing: str) -> None:
+        """Drop a worker from the index once it has no jobs and no liveness entry."""
+        alive = self._k(f"workers:{worker}")
+
+        def body(pipe: Any):
+            if pipe.llen(processing) or pipe.exists(alive):
+                return False, None
+            return True, lambda p: p.srem(self._k("worker_index"), worker)
+
+        self._transaction([processing, alive], body)
 
     @_guard
     def pending_count(self) -> int:
@@ -262,3 +331,36 @@ class RedisBackend(QueueBackend):
             return bool(self._r.ping())
         except self._redis_errors:
             return False
+
+    # -- worker liveness ---------------------------------------------------
+
+    @_guard
+    def worker_alive(self, worker_id: str, model_loaded: bool, ttl: float) -> None:
+        key, now = self._k(f"workers:{worker_id}"), self._now()
+        pipe = self._r.pipeline(transaction=True)
+        pipe.hsetnx(key, "started_at", now)
+        pipe.hset(key, mapping={"model_loaded": "true" if model_loaded else "false", "last_seen": now})
+        pipe.expire(key, max(1, int(ttl)))
+        pipe.sadd(self._k("worker_index"), worker_id)
+        pipe.execute()
+
+    @_guard
+    def worker_gone(self, worker_id: str) -> None:
+        self._r.delete(self._k(f"workers:{worker_id}"))
+
+    @_guard
+    def list_workers(self) -> List[WorkerInfo]:
+        found: List[WorkerInfo] = []
+        for worker in sorted(self._r.smembers(self._k("worker_index"))):
+            h = self._r.hgetall(self._k(f"workers:{worker}"))
+            if not h:
+                continue  # expired: it is dropped from the index by the next sweep
+            found.append(
+                WorkerInfo(
+                    worker_id=worker,
+                    model_loaded=h.get("model_loaded") == "true",
+                    started_at=float(h["started_at"]) if "started_at" in h else None,
+                    last_seen=float(h["last_seen"]) if "last_seen" in h else None,
+                )
+            )
+        return found
