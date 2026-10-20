@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Queue mode for long-running inference: `run(queue_url=...)` serves `POST /jobs` and `GET /jobs/{id}` and does not load the model; `run_worker(redis_url=...)` runs a worker. Redis-backed (`pip install fastmlapi[queue]`), with heartbeats, crash recovery and graceful shutdown.
+- `fastmlapi.queue` package: `QueueBackend`, `MemoryBackend`, `RedisBackend`, `Worker`
+- `result_ttl`, `visibility_timeout`, `max_attempts`, `heartbeat_interval` class attributes
+- `HealthResponse.queue_connected` / `queue_depth` (queue mode only)
+- `use_queue()` accepts a Redis URL (same key prefix as `run_worker(redis_url=...)`), for `uvicorn main:app` deployments
+- `RedisBackend(socket_timeout=5.0, socket_connect_timeout=5.0)`; options set in the URL take precedence
+
+- `FASTMLAPI_ROLE` (`sync` | `api` | `worker`) and `FASTMLAPI_QUEUE_URL`: `run()` (and `.app`) pick their role from the environment; `run_worker()` falls back to the URL
+- Worker liveness: workers publish `workers:{id}` (`model_loaded`, `started_at`, `last_seen`, TTL of 3 heartbeats); `QueueBackend.worker_alive/worker_gone/list_workers`; `queue_workers` / `queue_workers_ready` in the queue-mode `/health`
+- `REDIS_COMMANDS_USED` and a documented minimal Redis permission set
+
+### Changed
+
+- **The Redis backend no longer uses Lua scripts or `SCAN`.** Claims use `LMOVE`; all other transitions are `WATCH`/`MULTI`/`EXEC` transactions; workers are tracked in a `worker_index` set. Same behaviour, but a model can now run as a Redis user without scripting or key-listing permissions. Requires Redis 6.2+. A job taken off `pending` by a worker that died before marking it running is requeued after one `visibility_timeout`
+- The job's request body (`payload`) is deleted when the job reaches a terminal state (succeeded, failed, worker lost), and kept across requeues
+- `POST /predict` returns **422** (with `detail.errors`: `loc`, `msg`, `type`; submitted values are not echoed) for malformed JSON or a body that fails `request_model`; it used to return 500
+- `HealthResponse.model_loaded` is now optional (omitted in queue mode); sync-mode output is unchanged
+
 ## [0.2.0] - 2026-10-08
 
 ### Added
