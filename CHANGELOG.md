@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `max_pending` / `FASTMLAPI_MAX_PENDING` (default 1000): `POST /jobs` answers `429` (`QueueFull`, with `Retry-After`) once that many jobs are waiting, so one client cannot fill the queue's Redis.
+- `expose_errors` / `FASTMLAPI_EXPOSE_ERRORS` (default `true`): set to `false` to keep exception text out of 500 responses and failed jobs' `error`. `error_type` is still returned and the full error is still logged.
+
 - Queue mode for long-running inference: `run(queue_url=...)` serves `POST /jobs` and `GET /jobs/{id}` and does not load the model; `run_worker(redis_url=...)` runs a worker. Redis-backed (`pip install fastmlapi[queue]`), with heartbeats, crash recovery and graceful shutdown.
 - `fastmlapi.queue` package: `QueueBackend`, `MemoryBackend`, `RedisBackend`, `Worker`
 - `result_ttl`, `visibility_timeout`, `max_attempts`, `heartbeat_interval` class attributes

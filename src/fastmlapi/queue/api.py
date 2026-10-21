@@ -24,6 +24,10 @@ _ERROR_DETAIL = {
 _RESPONSES: Dict[Union[int, str], Dict[str, Any]] = {
     503: {**_ERROR_DETAIL, "description": "Job queue unavailable"},
 }
+_SUBMIT_RESPONSES: Dict[Union[int, str], Dict[str, Any]] = {
+    **_RESPONSES,
+    429: {**_ERROR_DETAIL, "description": "Too many jobs are waiting; retry later"},
+}
 
 
 def _unavailable(exc: QueueUnavailable) -> HTTPException:
@@ -40,6 +44,9 @@ def register_queue_routes(
     controller: Any,
     backend: QueueBackend,
     request_model: Type[BaseModel],
+    *,
+    max_pending: int = 0,
+    expose_errors: bool = True,
 ) -> None:
     @app.post(
         "/jobs",
@@ -47,7 +54,7 @@ def register_queue_routes(
         response_model=JobSubmitResponse,
         tags=["Jobs"],
         summary=f"Submit a {controller.model_name} job",
-        responses=_RESPONSES,
+        responses=_SUBMIT_RESPONSES,
     )
     async def submit_job(request: Request, body: request_model):  # type: ignore[valid-type]
         # `body` makes FastAPI validate (422) and document the schema. Store
@@ -55,6 +62,13 @@ def register_queue_routes(
         # as /predict does (aliases, validators and strict types all agree).
         payload = await request.json()
         try:
+            # Checked and enqueued separately, so a burst of simultaneous submissions can overshoot by a few.
+            if max_pending > 0 and await run_in_threadpool(backend.pending_count) >= max_pending:
+                raise HTTPException(
+                    status_code=429,
+                    detail={"error": "The job queue is full; retry later", "error_type": "QueueFull"},
+                    headers={"Retry-After": "5"},
+                )
             job_id = await run_in_threadpool(backend.enqueue, payload)
         except QueueUnavailable as exc:
             raise _unavailable(exc) from exc
@@ -87,7 +101,7 @@ def register_queue_routes(
             job_id=job.id,
             status=job.status,
             result=job.result,
-            error=job.error,
+            error=job.error if expose_errors or job.error is None else "The job failed",
             error_type=job.error_type,
             attempts=job.attempts,
             created_at=job.created_at,

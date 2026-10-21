@@ -317,6 +317,8 @@ raise `ValueError` at startup. This only limits PyTorch's caching allocator; oth
 | `FASTMLAPI_GPU_MEMORY_FRACTION` | unset | Overrides `gpu_memory_fraction` |
 | `FASTMLAPI_ROLE` | `sync` | What `run()` does: `sync` serves `/predict`, `api` serves `/jobs` (queue mode), `worker` runs queued jobs. See [Long-running jobs](#long-running-jobs-queue-mode) |
 | `FASTMLAPI_QUEUE_URL` | unset | Redis URL for the `api` and `worker` roles (also the default for `run_worker()`) |
+| `FASTMLAPI_MAX_PENDING` | `1000` (the `max_pending` class attribute) | Queued jobs the `api` role accepts before `POST /jobs` answers `429` with `error_type` `QueueFull` and `Retry-After`. `0` = no limit. The check and the enqueue are separate steps, so a burst can overshoot by a few |
+| `FASTMLAPI_EXPOSE_ERRORS` | `true` (the `expose_errors` class attribute) | `false` hides the text of exceptions from callers (500 bodies and a failed job's `error` become generic); `error_type` stays and the full error is still logged. The platform sets it to `false` for the models it runs |
 
 Arguments passed explicitly to `run(host=..., port=...)` take priority over the environment.
 

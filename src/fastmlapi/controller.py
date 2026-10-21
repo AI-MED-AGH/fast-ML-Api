@@ -42,6 +42,8 @@ ENV_CACHE_DIR = "FASTMLAPI_CACHE_DIR"
 ENV_GPU_MEMORY_FRACTION = "FASTMLAPI_GPU_MEMORY_FRACTION"
 ENV_ROLE = "FASTMLAPI_ROLE"
 ENV_QUEUE_URL = "FASTMLAPI_QUEUE_URL"
+ENV_MAX_PENDING = "FASTMLAPI_MAX_PENDING"
+ENV_EXPOSE_ERRORS = "FASTMLAPI_EXPOSE_ERRORS"
 ROLES = ("sync", "api", "worker")
 
 DEFAULT_HOST = "0.0.0.0"
@@ -155,6 +157,12 @@ class MLController(ABC):
     result_ttl: float = 3600.0          # seconds a finished job's result is kept
     visibility_timeout: float = 30.0    # seconds without a heartbeat before a job is requeued
     max_attempts: int = 3               # claims before a job is failed as "worker lost"
+    # Queued jobs the API accepts before answering 429 (0 = no limit). FASTMLAPI_MAX_PENDING overrides it.
+    max_pending: int = 1000
+
+    # Whether callers see the text of an exception (it can contain file paths and data). FASTMLAPI_EXPOSE_ERRORS overrides
+    # it; the platform sets it to false. The kind of failure (error_type) is always shown, the full error is always logged.
+    expose_errors: bool = True
     heartbeat_interval: float = 5.0     # seconds between worker heartbeats
     
     def __init__(self):
@@ -398,6 +406,24 @@ class MLController(ABC):
             backend = self._redis_backend(backend)
         self._queue_backend = backend
 
+    def _effective_max_pending(self) -> int:
+        raw = os.environ.get(ENV_MAX_PENDING)
+        if raw is None or raw == "":
+            return self.max_pending
+        if not raw.isdigit():
+            raise ValueError(f"Invalid {ENV_MAX_PENDING}={raw!r}: expected a whole number (0 = no limit)")
+        return int(raw)
+
+    def _expose_errors(self) -> bool:
+        raw = (os.environ.get(ENV_EXPOSE_ERRORS) or "").strip().lower()
+        if not raw:
+            return self.expose_errors
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+        raise ValueError(f"Invalid {ENV_EXPOSE_ERRORS}={raw!r}: expected true or false")
+
     @staticmethod
     def _role_from_env() -> str:
         """FASTMLAPI_ROLE: sync (default), api (serve /jobs) or worker (run queued jobs). Lets one image play any role
@@ -600,6 +626,8 @@ class MLController(ABC):
             redoc_url="/redoc" if self.enable_docs else None,
         )
         
+        expose_errors = self._expose_errors()
+
         # Global exception handler
         @app.exception_handler(Exception)
         async def global_exception_handler(request: Request, exc: Exception):
@@ -607,7 +635,7 @@ class MLController(ABC):
             return JSONResponse(
                 status_code=500,
                 content=ErrorResponse(
-                    error=str(exc),
+                    error=str(exc) if expose_errors else "Internal error",
                     error_type=type(exc).__name__,
                 ).model_dump(),
             )
@@ -667,9 +695,12 @@ class MLController(ABC):
         if self._queue_backend is not None:
             from .queue.api import register_queue_routes
 
-            register_queue_routes(app, self, self._queue_backend, RequestModel)
+            register_queue_routes(
+                app, self, self._queue_backend, RequestModel,
+                max_pending=self._effective_max_pending(), expose_errors=expose_errors,
+            )
         else:
-            self._register_predict_route(app, RequestModel, ResponseModel)
+            self._register_predict_route(app, RequestModel, ResponseModel, expose_errors=expose_errors)
         
         # Register custom routes
         for route_config in self._custom_routes:
@@ -692,6 +723,7 @@ class MLController(ABC):
         app: FastAPI,
         RequestModel: Type[BaseModel],
         ResponseModel: Type[BaseModel],
+        expose_errors: bool = True,
     ) -> None:
         # Predict endpoint
         
@@ -733,7 +765,7 @@ class MLController(ABC):
                 raise HTTPException(
                     status_code=500,
                     detail={
-                        "error": str(e),
+                        "error": str(e) if expose_errors else "Prediction failed",
                         "error_type": type(e).__name__,
                     },
                 )
