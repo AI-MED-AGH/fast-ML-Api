@@ -20,7 +20,7 @@ from __future__ import annotations
 import functools
 import json
 import uuid
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, cast
 from urllib.parse import parse_qs, urlparse
 
 from .backend import FAILED, QUEUED, RUNNING, SUCCEEDED, Job, QueueBackend, QueueUnavailable, WorkerInfo
@@ -162,8 +162,10 @@ class RedisBackend(QueueBackend):
     @_guard
     def claim(self, worker_id: str) -> Optional[Job]:
         # one atomic command moves the job off `pending`, so two workers can never take the same one
-        job_id = self._r.lmove(
-            self._k("pending"), self._k(f"processing:{worker_id}"), "RIGHT", "LEFT"
+        # decode_responses=True: the redis stubs still type replies as bytes | str
+        job_id = cast(
+            Optional[str],
+            self._r.lmove(self._k("pending"), self._k(f"processing:{worker_id}"), "RIGHT", "LEFT"),
         )
         if not job_id:
             return None
@@ -244,9 +246,9 @@ class RedisBackend(QueueBackend):
     def requeue_stale(self, visibility_timeout: float, max_attempts: int) -> int:
         now = self._now()
         touched = 0
-        for worker in sorted(self._r.smembers(self._k("worker_index"))):
+        for worker in sorted(cast(Set[str], self._r.smembers(self._k("worker_index")))):
             processing = self._k(f"processing:{worker}")
-            job_ids = self._r.lrange(processing, 0, -1)
+            job_ids = cast(List[str], self._r.lrange(processing, 0, -1))
             for job_id in job_ids:
                 if self._sweep_one(worker, processing, job_id, now, visibility_timeout, max_attempts):
                     touched += 1
@@ -351,7 +353,7 @@ class RedisBackend(QueueBackend):
     @_guard
     def list_workers(self) -> List[WorkerInfo]:
         found: List[WorkerInfo] = []
-        for worker in sorted(self._r.smembers(self._k("worker_index"))):
+        for worker in sorted(cast(Set[str], self._r.smembers(self._k("worker_index")))):
             h = self._r.hgetall(self._k(f"workers:{worker}"))
             if not h:
                 continue  # expired: it is dropped from the index by the next sweep

@@ -71,7 +71,7 @@ class Worker:
         stop_liveness = threading.Event()
         liveness = threading.Thread(target=self._liveness_loop, args=(stop_liveness,), daemon=True)
         liveness.start()
-        restore: Callable[[], None] = lambda: None
+        restore: Callable[[], None] = lambda: None  # noqa: E731
         try:
             self.controller._initialize()
             self._model_loaded = True
