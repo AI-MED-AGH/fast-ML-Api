@@ -20,7 +20,7 @@ from __future__ import annotations
 import functools
 import json
 import uuid
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from .backend import FAILED, QUEUED, RUNNING, SUCCEEDED, Job, QueueBackend, QueueUnavailable, WorkerInfo
@@ -54,7 +54,7 @@ def _guard(fn: Callable[..., Any]) -> Callable[..., Any]:
 def _to_job(job_id: str, h: Mapping[Any, Any]) -> Job:
     def num(key: str) -> Optional[float]:
         value = h.get(key)
-        return float(value) if value not in (None, "") else None
+        return None if value is None or value == "" else float(value)
 
     return Job(
         id=job_id,
@@ -99,7 +99,9 @@ class RedisBackend(QueueBackend):
             # redis-py 4.x unix-socket connections reject this keyword
             options.append(("socket_connect_timeout", socket_connect_timeout))
         timeouts = {name: value for name, value in options if name not in in_url}
-        self._r = redis.Redis.from_url(url, decode_responses=True, **timeouts)
+        # Any: with decode_responses=True replies are str, but the redis stubs type them as bytes | str, or as
+        # Awaitable[...] | T, depending on the version
+        self._r: Any = redis.Redis.from_url(url, decode_responses=True, **timeouts)
         self._redis_errors = redis.exceptions.RedisError
         self._watch_error = redis.exceptions.WatchError
         self._prefix = prefix
@@ -162,10 +164,8 @@ class RedisBackend(QueueBackend):
     @_guard
     def claim(self, worker_id: str) -> Optional[Job]:
         # one atomic command moves the job off `pending`, so two workers can never take the same one
-        # decode_responses=True: the redis stubs still type replies as bytes | str
-        job_id = cast(
-            Optional[str],
-            self._r.lmove(self._k("pending"), self._k(f"processing:{worker_id}"), "RIGHT", "LEFT"),
+        job_id = self._r.lmove(
+            self._k("pending"), self._k(f"processing:{worker_id}"), "RIGHT", "LEFT"
         )
         if not job_id:
             return None
@@ -246,9 +246,9 @@ class RedisBackend(QueueBackend):
     def requeue_stale(self, visibility_timeout: float, max_attempts: int) -> int:
         now = self._now()
         touched = 0
-        for worker in sorted(cast(Set[str], self._r.smembers(self._k("worker_index")))):
+        for worker in sorted(self._r.smembers(self._k("worker_index"))):
             processing = self._k(f"processing:{worker}")
-            job_ids = cast(List[str], self._r.lrange(processing, 0, -1))
+            job_ids = self._r.lrange(processing, 0, -1)
             for job_id in job_ids:
                 if self._sweep_one(worker, processing, job_id, now, visibility_timeout, max_attempts):
                     touched += 1
@@ -353,7 +353,7 @@ class RedisBackend(QueueBackend):
     @_guard
     def list_workers(self) -> List[WorkerInfo]:
         found: List[WorkerInfo] = []
-        for worker in sorted(cast(Set[str], self._r.smembers(self._k("worker_index")))):
+        for worker in sorted(self._r.smembers(self._k("worker_index"))):
             h = self._r.hgetall(self._k(f"workers:{worker}"))
             if not h:
                 continue  # expired: it is dropped from the index by the next sweep
